@@ -1,0 +1,9 @@
+log/*
+.env
+utils/__pycache__
+nohup.out
+test/*
+test.py
+run-test.sh
+test2.py
+.DS_Store
