@@ -6,6 +6,7 @@ import time
 from modelscope.hub.api import HubApi
 from openmind_hub import OmApi, RepoFile
 from utils import model_updown
+from utils import gitcode_conn
 import traceback
 from datetime import datetime as dt 
 
@@ -154,20 +155,28 @@ def get_work_queue(modelers_api:OmApi, scope_api:HubApi, config:dict):
     res_list=get_file_level_worklist(same_models_list, modelers_api, scope_api, config)
     works_list.extend(res_list)
     
+    
     # 模型级别同步列表
     # 模型级别同步需要注意：如果模型下面的文件没有.safetensors文件，则不同步此模型
     download_from_scope= list(set(scope_res).difference(set(modelers_res)))
     download_from_modelers= list(set(modelers_res).difference(set(scope_res)))
     
+    ## gitcode同步
+    gitcode_res=gitcode_conn.get_model_list(config=config)
+    import_to_gitcode=list(set(scope_visibility_res).difference(set(gitcode_res)))
+    
     MODELERS_NAME=config['constant']['MODELERS_NAME']
     MODELSCOPE_NAME=config['constant']['MODELSCOPE_NAME']
+    GITCODE_NAME=config['constant']['GITCODE_NAME']
     
     for m in download_from_modelers:
         works_list.append([m, MODELSCOPE_NAME])        
     
     for m in download_from_scope:
         works_list.append([m, MODELERS_NAME])
-
+        
+    for m in import_to_gitcode:
+        works_list.append([m, GITCODE_NAME]) 
     return  works_list
 
 def get_readme_in_directory(directory):

@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from modelscope.hub.api import HubApi
 from openmind_hub import OmApi
+from utils import model_tools,model_updown, gitcode_conn
 
 import logging
 import logging.config
@@ -47,6 +48,7 @@ if __name__=="__main__":
     
     MODELERS_NAME=config['constant']['MODELERS_NAME']
     MODELSCOPE_NAME=config['constant']['MODELSCOPE_NAME']
+    GITCODE_NAME=config['constant']['GITCODE_NAME']
     
     update_sync_deque(modelers_api, scope_api, config, logger)
     
@@ -71,6 +73,8 @@ if __name__=="__main__":
                 elif work[1]==MODELERS_NAME:
                     # print(f"INFO：开始同步模型：{work[0]}, 下载到{MODELERS_NAME}")
                     res= model_updown.scope2modelers_model(work[0],modelers_api,scope_api,config)
+                elif work[1]==GITCODE_NAME:
+                    res= gitcode_conn.create_repo(work[0],config)
 
             if res==0:
                 logger.info(f"{work} 完成")
