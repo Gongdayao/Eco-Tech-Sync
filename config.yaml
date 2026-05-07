@@ -1,0 +1,37 @@
+# global config
+global:
+  weights_path: ${WEIGHTS_PATH}
+  logger_name: "applog"
+
+constant:
+  MODELERS_NAME: "modelers"
+  MODELSCOPE_NAME: "scope"
+  FILE_OPTION_UPDATE: "update"
+  FILE_OPTION_DELETE: "delete"  
+
+# modelscope config
+modelscope_cfg:
+  repo_name: ${SCOPE_REPO_NAME}
+  token: ${SCOPE_TOKEN}
+  license_name: "license"
+  license:
+    - "Apache License 2.0"
+    - "MIT License"
+    - "GPL-2.0"
+    - "GPL-3.0" 
+    - "LGPL-3.0"
+    - "other"
+
+
+# modelers config
+modelers_cfg:
+  repo_name: ${MODELERS_REPO_NAME}
+  token: ${MODELERS_TOKEN}
+  license_name: "license"
+  license:
+    - "apache-2.0"
+    - "mit"
+    - "gpl-2.0"
+    - "gpl-3.0" 
+    - "lgpl-3.0"
+    - "other"

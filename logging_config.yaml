@@ -1,0 +1,66 @@
+# logging_config.yaml
+version: 1
+disable_existing_loggers: False
+
+formatters:
+  standard:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  detailed:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: ERROR
+    formatter: standard
+    stream: ext://sys.stdout
+
+  info_log:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: "log/info.log"
+    
+    # 滚动时间设置
+    when: "midnight"        # 可选: S(秒), M(分), H(时), D(天), midnight(午夜), W0-W6(周几)
+    interval: 1            # 时间间隔
+    
+    # 备份设置
+    backupCount: 90        # 保留30个备份文件
+    delay: False           # 是否延迟创建文件
+    
+    # 编码和时区设置
+    encoding: "utf-8"
+    utc: False             # 是否使用UTC时间
+    
+    # 后缀格式（可选）
+    # suffix: "%Y-%m-%d_%H-%M-%S"
+    
+    # atTime参数（用于midnight或指定时间）
+    # atTime: 23:59        # 当when为midnight或指定小时时使用
+
+  # error_file:
+  #   class: logging.handlers.TimedRotatingFileHandler
+  #   level: ERROR
+  #   formatter: detailed
+  #   filename: "log/error.log"
+  #   when: "S"            # 每周一滚动
+  #   interval: 10
+  #   backupCount: 30       # 保留12周的错误日志
+  #   encoding: "utf-8"
+
+loggers:
+  applog:
+    level: DEBUG
+    handlers: [console, info_log]
+    propagate: False
+
+  # mymodule:
+  #   level: INFO
+  #   handlers: [info_log]
+  #   propagate: True
+
+root:
+  level: ERROR
+  handlers: [console]
