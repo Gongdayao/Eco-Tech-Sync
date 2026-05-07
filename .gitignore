@@ -6,3 +6,4 @@ test/*
 test.py
 run-test.sh
 test2.py
+.DS_Store
