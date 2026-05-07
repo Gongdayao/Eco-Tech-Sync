@@ -6,6 +6,7 @@ global:
 constant:
   MODELERS_NAME: "modelers"
   MODELSCOPE_NAME: "scope"
+  GITCODE_NAME: "gitcode"
   FILE_OPTION_UPDATE: "update"
   FILE_OPTION_DELETE: "delete"  
 
@@ -35,3 +36,10 @@ modelers_cfg:
     - "gpl-3.0" 
     - "lgpl-3.0"
     - "other"
+
+
+# gitcode config
+gitcode_cfg:
+  token: ${GITCODE_TOKEN}
+  repo_name: {GITCODE_REPO_NAME}
+  scope_base_url: "https://www.modelscope.cn/models/"
