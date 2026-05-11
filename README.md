@@ -1,160 +1,162 @@
-# Eco-Tech Model Synchronizer
+[English](README_en.md) | **中文**
+
+# Eco-Tech 模型同步器
 
 ---
 
-魔乐 (Modelers) / 魔塔 (ModelScope) / GitCode 模型自动同步器
+魔乐 (Modelers) / 魔搭 (ModelScope) / GitCode 模型自动同步器
 
-A background service that automatically syncs AI model weights across three Chinese model hosting platforms — **Modelers (魔乐社区)**, **ModelScope (魔搭)**, and **GitCode**.
+一个后台服务，自动在三个国内模型托管平台之间同步 AI 模型权重 —— **Modelers（魔乐社区）**、**ModelScope（魔搭）** 和 **GitCode**。
 
-## Features
+## 功能特性
 
-- **Bidirectional model-level sync** — detects models that exist on one platform but not another, and mirrors them automatically
-- **File-level delta sync** — for models present on both platforms, compares individual files by SHA256 and only uploads what changed
-- **GitCode mirror creation** — automatically creates GitCode repos by importing from ModelScope
-- **Daemon mode** — runs continuously as a background service with a work queue, refreshing periodically
-- **Resume support** — parallel SHA256 comparison and selective re-download for broken/partial syncs
-- **README/license handling** — strips YAML front matter from READMEs, auto-adds license information on Modelers
+- **双向模型级同步** — 检测在一个平台上存在但另一个平台上缺失的模型，并自动镜像同步
+- **文件级增量同步** — 对于两个平台上都存在的模型，按 SHA256 逐文件比对，仅上传变更的文件
+- **GitCode 镜像创建** — 通过从 ModelScope 导入自动创建 GitCode 仓库
+- **守护进程模式** — 作为后台服务持续运行，使用工作队列，定期刷新
+- **断点续传支持** — 并行 SHA256 比对和选择性重新下载，用于修复中断或不完整的同步
+- **README/许可证处理** — 从 README 中去除 YAML 前置元数据，在 Modelers 上自动添加许可证信息
 
-## Architecture
+## 架构
 
 ```
-Modelers (魔乐)  <── bidirectional model sync ──>  ModelScope (魔搭)
-                                                      │
-                                                      │ (model discovery only)
-                                                      ▼
-                                                  GitCode
+Modelers (魔乐)  <── 双向模型同步 ──>  ModelScope (魔搭)
+                                                        │
+                                                        │ (仅模型发现)
+                                                        ▼
+                                                    GitCode
 ```
 
-- **Model-level sync** is bidirectional between Modelers and ModelScope
-- **File-level sync** is one-way: ModelScope → Modelers
-- GitCode repos are created via ModelScope `.git` import URLs, with a prompt to enable pull mirror mode
+- **模型级同步** 在 Modelers 和 ModelScope 之间双向进行
+- **文件级同步** 为单向：ModelScope → Modelers
+- GitCode 仓库通过 ModelScope `.git` 导入 URL 创建，并提示启用拉取镜像模式
 
-### Work Queue Model
+### 工作队列模型
 
-The daemon maintains an in-memory work queue (deque) refreshed every 12 hours:
+守护进程维护一个内存工作队列（双端队列），每 12 小时刷新一次：
 
-| Work Item Type | Format | Description |
+| 工作项类型 | 格式 | 说明 |
 |---|---|---|
-| Model sync | `[model_name, target_platform]` | Sync entire model to target platform |
-| File update | `[model_name, platform, file_name, "update"]` | Upload changed file |
-| File delete | `[model_name, platform, file_name, "delete"]` | Remove stale file from Modelers |
+| 模型同步 | `[模型名称, 目标平台]` | 将整个模型同步到目标平台 |
+| 文件更新 | `[模型名称, 平台, 文件名, "update"]` | 上传变更的文件 |
+| 文件删除 | `[模型名称, 平台, 文件名, "delete"]` | 从 Modelers 删除过期文件 |
 
-## Prerequisites
+## 环境要求
 
 - Python 3.8+
-- Linux server with sufficient disk space for model weights (typically hundreds of GB)
-- API tokens for **ModelScope**, **Modelers (openMind)**, and **GitCode**
+- Linux 服务器，具备足够的磁盘空间存放模型权重（通常数百 GB）
+- **ModelScope**、**Modelers (openMind)** 和 **GitCode** 的 API 令牌
 
-## Installation
+## 安装
 
 ```bash
-# Clone the repository
-git clone <repo-url> 
+# 克隆仓库
+git clone <repo-url>
 cd Eco-Tech-Sync
 
-# Install dependencies
+# 安装依赖
 pip install modelscope openmind_hub pyyaml python-dotenv env_yaml apscheduler tqdm
 ```
 
-## Configuration
+## 配置
 
-### 1. Create `.env` (from `.env` template)
+### 1. 创建 `.env` 文件（基于 `.env` 模板）
 
 ```env
-WEIGHTS_PATH="your_weight_work_path"
-MODELERS_TOKEN="your_modelers_token"
-MODELERS_REPO_NAME="YourOrgName"
-SCOPE_TOKEN="your_modelscope_token"
-SCOPE_REPO_NAME="YourOrgName"
-GITCODE_TOKEN="your_gitcode_token"
-GITCODE_REPO_NAME="YourOrgName"
+WEIGHTS_PATH="你的权重工作路径"
+MODELERS_TOKEN="你的_modelers_令牌"
+MODELERS_REPO_NAME="你的组织名称"
+SCOPE_TOKEN="你的_modelscope_令牌"
+SCOPE_REPO_NAME="你的组织名称"
+GITCODE_TOKEN="你的_gitcode_令牌"
+GITCODE_REPO_NAME="你的组织名称"
 ```
 
-### 2. Verify `config.yaml`
+### 2. 验证 `config.yaml`
 
-The config uses `${ENV_VAR}` placeholders resolved from `.env`. Key sections:
+配置文件使用 `${ENV_VAR}` 占位符，由 `.env` 中的值替换。主要配置项：
 
-| Section | Description |
+| 配置项 | 说明 |
 |---|---|
-| `global` | Local weights storage path, logger name |
-| `modelscope_cfg` | ModelScope API credentials and supported licenses |
-| `modelers_cfg` | Modelers API credentials and supported licenses |
-| `gitcode_cfg` | GitCode API credentials and ModelScope base URL for imports |
+| `global` | 本地权重存储路径、日志名称 |
+| `modelscope_cfg` | ModelScope API 凭证和支持的许可证 |
+| `modelers_cfg` | Modelers API 凭证和支持的许可证 |
+| `gitcode_cfg` | GitCode API 凭证和用于导入的 ModelScope 基础 URL |
 
-### 3. Configure `logging_config.yaml`
+### 3. 配置 `logging_config.yaml`
 
-Default: daily rotating logs in `log/` with 90-day retention.
+默认：每日滚动日志存储在 `log/` 目录，保留 90 天。
 
-## Usage
+## 使用方法
 
-### Start the daemon (recommended for production)
+### 启动守护进程（生产环境推荐）
 
 ```bash
 bash run.sh
 ```
 
-This launches `server-work.py` as a background process with `nohup`. The daemon:
-1. Generates a work queue by comparing all three platforms
-2. Processes sync tasks one at a time (60s pause between tasks)
-3. Refreshes the work queue every 12 hours
-4. Sleeps 30 minutes when queue is empty before checking again
+此命令通过 `nohup` 将 `server-work.py` 作为后台进程启动。守护进程会：
+1. 通过比较三个平台生成工作队列
+2. 逐个处理同步任务（任务之间暂停 60 秒）
+3. 每 12 小时刷新工作队列
+4. 队列为空时休眠 30 分钟再重新检查
 
-### One-shot batch sync
+### 一次性批量同步
 
 ```bash
 python static_work.py
 ```
 
-Computes the full work queue once, processes all items, then reports success/failure.
+计算一次完整工作队列，处理所有任务后报告成功/失败。
 
-### Single model sync
+### 单个模型同步
 
 ```bash
 bash run-single.sh
 ```
 
-Syncs a single specified model. Edit `single_sync.py` to change the target model name.
+同步单个指定模型。编辑 `single_sync.py` 修改目标模型名称。
 
-### Resume / repair sync
+### 断点续传/修复同步
 
 ```bash
 bash run-resume.sh
 ```
 
-Compares local SHA256 hashes with remote, downloads only changed `.safetensors` files. Uses parallel processing (64 workers) for fast comparison.
+将本地 SHA256 哈希值与远程比对，仅下载变更的 `.safetensors` 文件。使用并行处理（64 个线程）实现快速比对。
 
-## Project Structure
+## 项目结构
 
 ```
 model_syn/
-├── server-work.py          # Main daemon (continuous background sync)
-├── static_work.py          # One-shot batch sync
-├── single_sync.py          # Single model sync
-├── resume_sync.py          # Resume/repair broken downloads
-├── park_sync.py            # Sync from Modelers_Park namespace
+├── server-work.py          # 主守护进程（持续后台同步）
+├── static_work.py          # 一次性批量同步
+├── single_sync.py          # 单个模型同步
+├── resume_sync.py          # 断点续传/修复中断的下载
+├── park_sync.py            # 从 Modelers_Park 命名空间同步
 │
-├── utils/                  # Core library
-│   ├── model_tools.py      # Work queue generation, file diff, README/license utils
-│   ├── model_updown.py     # All download/upload/sync operations
-│   └── gitcode_conn.py     # GitCode API client
+├── utils/                  # 核心库
+│   ├── model_tools.py      # 工作队列生成、文件差异对比、README/许可证工具
+│   ├── model_updown.py     # 所有下载/上传/同步操作
+│   └── gitcode_conn.py     # GitCode API 客户端
 │
-├── config.yaml             # Main configuration
-├── logging_config.yaml     # Logging configuration
-├── .env                    # Secrets & environment variables (gitignored)
+├── config.yaml             # 主配置文件
+├── logging_config.yaml     # 日志配置文件
+├── .env                    # 密钥和环境变量（已 gitignore）
 │
-├── run.sh                  # Launch daemon
-├── run-single.sh           # Launch single sync
-├── run-resume.sh           # Launch resume sync
+├── run.sh                  # 启动守护进程
+├── run-single.sh           # 启动单个模型同步
+├── run-resume.sh           # 启动断点续传同步
 │
-└── log/                    # Logs (gitignored)
-    ├── info.log            # Application log (daily rotation)
-    └── server-std.log      # Daemon stdout
+└── log/                    # 日志（已 gitignore）
+    ├── info.log            # 应用日志（每日滚动）
+    └── server-std.log      # 守护进程标准输出
 ```
 
-## Notes
+## 注意事项
 
-- Only models containing `.safetensors` weight files are synced; non-weight repos are skipped
-- Default LICENSE files automatically generated by ModelScope are detected and filtered out during comparison
-- The `.env` file containing tokens is excluded from git via `.gitignore`
-- Logs and test scripts are excluded from version control
-- All shell scripts set `HUB_WHITE_LIST_PATHS` and cache directories for Modelers SDK compatibility
+- 仅同步包含 `.safetensors` 权重文件的模型；跳过不含权重的仓库
+- ModelScope 自动生成的默认 LICENSE 文件在比对时会被检测并过滤
+- 包含令牌的 `.env` 文件通过 `.gitignore` 排除在版本控制之外
+- 日志和测试脚本被排除在版本控制之外
+- 所有 Shell 脚本均设置了 `HUB_WHITE_LIST_PATHS` 和缓存目录以确保 Modelers SDK 兼容
