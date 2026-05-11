@@ -7,3 +7,4 @@ test.py
 run-test.sh
 test2.py
 .DS_Store
+.sync_queue_state.json

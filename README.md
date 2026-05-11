@@ -14,6 +14,7 @@
 - **文件级增量同步** — 对于两个平台上都存在的模型，按 SHA256 逐文件比对，仅上传变更的文件
 - **GitCode 镜像创建** — 通过从 ModelScope 导入自动创建 GitCode 仓库
 - **守护进程模式** — 作为后台服务持续运行，使用工作队列，定期刷新
+- **优雅退出** — 支持 SIGTERM 信号停止，退出前自动保存未完成队列，重启后恢复
 - **断点续传支持** — 并行 SHA256 比对和选择性重新下载，用于修复中断或不完整的同步
 - **README/许可证处理** — 从 README 中去除 YAML 前置元数据，在 Modelers 上自动添加许可证信息
 
@@ -55,7 +56,7 @@ git clone <repo-url>
 cd Eco-Tech-Sync
 
 # 安装依赖
-pip install modelscope openmind_hub pyyaml python-dotenv env_yaml apscheduler tqdm
+pip install -r requirements.txt
 ```
 
 ## 配置
@@ -95,11 +96,22 @@ GITCODE_REPO_NAME="你的组织名称"
 bash run.sh
 ```
 
-此命令通过 `nohup` 将 `server-work.py` 作为后台进程启动。守护进程会：
-1. 通过比较三个平台生成工作队列
-2. 逐个处理同步任务（任务之间暂停 60 秒）
-3. 每 12 小时刷新工作队列
-4. 队列为空时休眠 30 分钟再重新检查
+此命令通过 `nohup` 将 `server-work.py` 作为后台进程启动，PID 记录在 `log/daemon.pid`。守护进程会：
+1. 恢复上次未完成的任务（如果存在 `.sync_queue_state.json`）
+2. 通过比较三个平台生成工作队列
+3. 逐个处理同步任务（任务之间暂停 60 秒）
+4. 每 12 小时刷新工作队列
+5. 队列为空时休眠 30 分钟再重新检查
+
+### 停止守护进程
+
+```bash
+bash run.sh stop
+# 或
+bash run-stop.sh
+```
+
+发送 SIGTERM 信号，守护进程完成当前任务后保存队列状态并退出。若 30 秒内未退出则强制终止。
 
 ### 一次性批量同步
 
@@ -142,15 +154,18 @@ model_syn/
 │
 ├── config.yaml             # 主配置文件
 ├── logging_config.yaml     # 日志配置文件
+├── requirements.txt        # Python 依赖
 ├── .env                    # 密钥和环境变量（已 gitignore）
 │
-├── run.sh                  # 启动守护进程
+├── run.sh                  # 启动/停止守护进程
 ├── run-single.sh           # 启动单个模型同步
 ├── run-resume.sh           # 启动断点续传同步
+├── run-stop.sh             # 停止守护进程
 │
 └── log/                    # 日志（已 gitignore）
     ├── info.log            # 应用日志（每日滚动）
-    └── server-std.log      # 守护进程标准输出
+    ├── server-std.log      # 守护进程标准输出
+    └── daemon.pid          # 守护进程 PID
 ```
 
 ## 注意事项
@@ -159,4 +174,5 @@ model_syn/
 - ModelScope 自动生成的默认 LICENSE 文件在比对时会被检测并过滤
 - 包含令牌的 `.env` 文件通过 `.gitignore` 排除在版本控制之外
 - 日志和测试脚本被排除在版本控制之外
-- 所有 Shell 脚本均设置了 `HUB_WHITE_LIST_PATHS` 和缓存目录以确保 Modelers SDK 兼容
+- Shell 脚本从 `.env` 读取 `WEIGHTS_PATH`，自动设置 `HUB_WHITE_LIST_PATHS` 和缓存目录
+- 停止守护进程时，未完成的任务保存至 `.sync_queue_state.json`，重启后自动恢复
