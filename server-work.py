@@ -97,7 +97,6 @@ if __name__=="__main__":
 
     saved = load_saved_queue(logger)
     if saved:
-        global sync_que
         sync_que = saved
     
     signal.signal(signal.SIGTERM, lambda sig, frame: shutdown_handler(sig, frame, logger, sched))
