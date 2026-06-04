@@ -4,9 +4,9 @@
 
 ---
 
-魔乐 (Modelers) / 魔搭 (ModelScope) / GitCode 模型自动同步器
+魔乐 (Modelers) / 魔塔 (ModelScope) / GitCode 模型自动同步器
 
-一个后台服务，自动在三个国内模型托管平台之间同步 AI 模型权重 —— **Modelers（魔乐社区）**、**ModelScope（魔搭）** 和 **GitCode**。
+一个后台服务，自动在三个国内模型托管平台之间同步 AI 模型权重 —— **Modelers（魔乐社区）**、**ModelScope（魔塔）** 和 **GitCode**。
 
 ## 功能特性
 
@@ -21,7 +21,7 @@
 ## 架构
 
 ```
-Modelers (魔乐)  <── 双向模型同步 ──>  ModelScope (魔搭)
+Modelers (魔乐)  <── 双向模型同步 ──>  ModelScope (魔塔)
                                                         │
                                                         │ (仅模型发现)
                                                         ▼
