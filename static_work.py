@@ -47,7 +47,7 @@ def main():
         idx+=1
     
     print("成功的模型：")
-    print(succss_list)
+    print(success_list)
     print("失败的模型：")
     print(error_list)
     

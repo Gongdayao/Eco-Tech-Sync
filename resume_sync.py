@@ -1,5 +1,7 @@
 import os
 import yaml
+from dotenv import load_dotenv
+from env_yaml import EnvLoader
 from utils import model_tools,model_updown
 import traceback
 from modelscope.hub.api import HubApi
@@ -31,9 +33,11 @@ if __name__=="__main__":
     
     org_name="Eco-Tech"
     model_list=["GLM-5.1-w8a8"]
-
+    
+    load_dotenv()
+    
     with open('./config.yaml', 'r', encoding='utf-8') as f:
-        config = yaml.load(f.read(), Loader=yaml.FullLoader)
+        config = yaml.load(f.read(), Loader=EnvLoader)
     scope_api = HubApi()
     scope_api.login(config["modelscope_cfg"]['token'])
     modelers_api= OmApi(token=config["modelers_cfg"]['token'])

@@ -41,5 +41,5 @@ modelers_cfg:
 # gitcode config
 gitcode_cfg:
   token: ${GITCODE_TOKEN}
-  repo_name: {GITCODE_REPO_NAME}
+  repo_name: ${GITCODE_REPO_NAME}
   scope_base_url: "https://www.modelscope.cn/models/"
