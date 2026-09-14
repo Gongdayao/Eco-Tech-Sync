@@ -311,12 +311,14 @@ def cmd_daemon(args) -> int:
                     q = r.get("queue", {}) or {}
                     f = r.get("file", {}) or {}
                     rh = r.get("rehash", {}) or {}
+                    q_txt = ("跳过(本轮走全量扫描)" if q.get("skipped_full_sweep") else
+                             f"在管={q.get('managed')} 变动={q.get('dirty')} "
+                             f"入队={q.get('enq')} 已一致={q.get('clean')} "
+                             f"跳过(已有任务)={q.get('skip_pending')}")
                     print(f"[daemon] 对账完成 org={r.get('org')} 耗时 {time.time() - t_rc:.0f}s | "
                           f"模型级: 新增→魔乐={m.get('to_modelers')} 反向={m.get('to_scope')} "
                           f"删除={m.get('repo_delete')} 采纳={m.get('adopted')} | "
-                          f"队列生成(仅 model_list): 在管={q.get('managed')} 变动={q.get('dirty')} "
-                          f"入队={q.get('enq')} 已一致={q.get('clean')} "
-                          f"跳过(已有任务)={q.get('skip_pending')} | "
+                          f"队列生成(仅 model_list): {q_txt} | "
                           f"文件级[{f.get('mode', '-')}]: 检查={f.get('checked')} "
                           f"上传={f.get('to_correct')} 待删={f.get('to_delete')} "
                           f"独有={f.get('extra')} 入队={f.get('file_batch_enq')} "
