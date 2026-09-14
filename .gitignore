@@ -11,6 +11,7 @@ tests/
 
 log/*
 !log/.gitkeep
+weights/
 tmp/
 temp/
 *.log
