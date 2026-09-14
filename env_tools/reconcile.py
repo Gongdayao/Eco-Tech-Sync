@@ -1076,7 +1076,11 @@ def scheduler_tick(conn, orgs, now: int | None = None, force: bool = False) -> l
         last = db.get_app_config(conn, org.id, "sync.last_reconcile", 0) or 0
         throttled = bool(last) and now - int(last) < interval_s
         if throttled and not force:
-            results.append({"org": org.id, "skipped": True})
+            # next_at 供调用方(daemon)做"每个节流窗口只记一次日志"的去重键; 30s 空转轮询
+            # 会反复走到这里, 每轮都打一行会把日志刷满(2026-09-14)。
+            results.append({"org": org.id, "skipped": True,
+                            "next_at": int(last) + interval_s,
+                            "interval_min": int(interval_min)})
             continue
         if throttled and force:
             print(f"[reconcile] {org.id} 强制对账(--force): 忽略 {interval_min}min 节流"

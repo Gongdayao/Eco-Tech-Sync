@@ -286,6 +286,9 @@ def cmd_daemon(args) -> int:
     pid = os.getpid()
     db.touch_heartbeat(conn, pid)
     print(f"[daemon] 启动 pid={pid} orgs={[o.id for o in orgs]}")
+    # 节流跳过日志去重: 键=该 org 的"下次对账时刻", 同一个窗口只打一行(2026-09-14)。
+    # 30s 空转轮询照旧(要在 ≤30s 内领走新任务), 但不能每轮刷一行日志。
+    skip_logged = {}
 
     while _running:
         # 先取任务(响应优先): 队列非空时先干活, 对账只在空队列空闲时跑
@@ -303,7 +306,13 @@ def cmd_daemon(args) -> int:
             t_rc = time.time()
             for r in reconcile.scheduler_tick(conn, orgs):
                 if r.get("skipped"):
-                    print(f"[daemon] 对账节流跳过 org={r.get('org')}")
+                    key = r.get("next_at")
+                    if skip_logged.get(r.get("org")) != key:
+                        skip_logged[r.get("org")] = key
+                        nxt = time.strftime("%H:%M:%S", time.localtime(key)) if key else "?"
+                        print(f"[daemon] 对账节流中 org={r.get('org')} "
+                              f"(窗口 {r.get('interval_min', '?')}min, 下次对账约 {nxt}; "
+                              f"要立即执行: audit --force)")
                 elif "error" in r:
                     print(f"[daemon] 对账异常 org={r.get('org')}: {r['error']}")
                 else:
