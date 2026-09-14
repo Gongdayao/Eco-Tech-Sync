@@ -370,30 +370,49 @@ def _refresh_baselines(conn, org, model: str, now: int | None = None) -> None:
     conn.commit()
 
 
+_SCOPE_LM_WARNED = False          # 魔塔单仓 last_modified 接口不可用时只提示一次
+
+
 def repo_last_modified(org, platform: str, model: str) -> int | None:
     """单仓 last_modified(与各自 model_list 同源同值; epoch 秒), 取不到 → None。
 
     2026-09-14 调度重构: 队列生成阶段只拉 model_list 并用 last_modified 判"该 repo 是否
     有文件级变动"; 任务执行阶段核验完成后, 用本函数把**该仓当前版本**回写为"已核验"
     (models.files_verified_lm) —— 必须用同一来源的值, 否则两侧永远判不相等。
-      魔塔: HubApi.get_model(repo_id)['UpdatedAt'](ISO; 实测与列表值逐秒一致)
-      魔乐: model_info(repo_id).last_modified(epoch; 实测与列表值完全一致)
-    异常/取不到 → None: 调用方保持 dirty(宁可下轮多扫一次, 不漏变更)。
+      魔塔: `get_repo(repo_id, repo_type='model').last_modified`(datetime; 实测与列表值逐秒一致)
+            —— 注意: 生产 SDK 是 `modelscope_hub`, **没有** `get_model`;
+            `get_model` 只在另一套 `modelscope` 包里存在, 故只作为可选回退。
+      魔乐: `model_info(repo_id).last_modified`(epoch; 实测与列表值完全一致)
+    异常/取不到 → None: 调用方会回退到 models.last_modified(见 record_files_verified)。
     """
+    global _SCOPE_LM_WARNED
     repo_id = _repo_id(org, platform, model)
     try:
         global_limiter.wait()
         if platform == "scope":
-            mo = _scope_api(org).get_model(repo_id, revision="master")
-            raw = mo.get("UpdatedAt") if isinstance(mo, dict) else _get(mo, "UpdatedAt", None)
-            return _to_epoch(raw)
+            api = _scope_api(org)
+            if hasattr(api, "get_repo"):          # modelscope_hub(生产): 正确通道
+                ri = api.get_repo(repo_id, repo_type="model")
+                return _to_epoch(_get(ri, "last_modified", None))
+            if hasattr(api, "get_model"):         # 兼容旧/另一套 SDK
+                mo = api.get_model(repo_id, revision="master")
+                raw = mo.get("UpdatedAt") if isinstance(mo, dict) else _get(mo, "UpdatedAt", None)
+                return _to_epoch(raw)
+            if not _SCOPE_LM_WARNED:
+                _SCOPE_LM_WARNED = True
+                print("[transfer] 魔塔 SDK 无 get_repo/get_model → 单仓 last_modified "
+                      "回退 models.last_modified(本轮 model_list 值)", flush=True)
+            return None
         from openmind_hub import model_info
         mi = model_info(repo_id, token=org.modelers.token)
         raw = _get(mi, "last_modified", None) if not isinstance(mi, dict) else mi.get("last_modified")
         return _to_epoch(raw)
     except Exception as e:
-        print(f"[transfer] 读取 {platform}/{model} last_modified 失败: "
-              f"{type(e).__name__}: {e}", flush=True)
+        if not _SCOPE_LM_WARNED:
+            _SCOPE_LM_WARNED = True
+            print(f"[transfer] 读取 {platform}/{model} last_modified 失败"
+                  f"({type(e).__name__}: {e}); 后续同类失败静默, 回退 models.last_modified",
+                  flush=True)
         return None
 
 
@@ -402,14 +421,25 @@ def record_files_verified(conn, org, model: str, scope_lm: int | None = None,
     """把"该侧文件树已核验"的仓版本写入 models.files_verified_lm(v8, 2026-09-14)。
 
     **只在核验成功时调用**: 采纳/无差异的 diff 之后, 或同步/删除成功之后。
-    未传入的一侧现取(repo_last_modified); 取不到则保持原值(下轮继续 dirty)。
+    取值优先级: 调用方传入(全量扫描时来自 model_list, 零请求) → 单仓接口
+    (repo_last_modified) → **models.last_modified 兜底**(每轮 model_list 刷新, 最多
+    滞后一个对账周期, 不会永久 dirty)。2026-09-14 生产事故: 魔塔单仓接口取不到时
+    只写了魔乐一侧 → 魔塔侧永远 dirty → 同一模型每 15 分钟入队一次空转。
     """
+    def _db_lm(plat: str) -> int | None:
+        row = conn.execute(
+            "SELECT last_modified FROM models WHERE org=? AND platform=? AND repo_id=?",
+            (org.id, plat, _repo_id(org, plat, model))).fetchone()
+        return (row["last_modified"] if row is not None else None)
+
     out: dict = {}
-    if scope_lm is None:
-        scope_lm = repo_last_modified(org, "scope", model)
-    if modelers_lm is None:
-        modelers_lm = repo_last_modified(org, "modelers", model)
-    for plat, lm in (("scope", scope_lm), ("modelers", modelers_lm)):
+    vals = {"scope": scope_lm, "modelers": modelers_lm}
+    for plat in ("scope", "modelers"):
+        lm = vals[plat]
+        if lm is None:
+            lm = repo_last_modified(org, plat, model)
+        if lm is None:
+            lm = _db_lm(plat)                 # 兜底: models.last_modified(本轮 list 值)
         if lm is None:
             continue
         conn.execute(

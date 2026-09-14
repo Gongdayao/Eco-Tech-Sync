@@ -25,6 +25,21 @@ def _commit(conn) -> None:
     conn.commit()
 
 
+def _is_sha256(v) -> bool:
+    """是否是"内容 sha256"(64 位十六进制)。
+
+    2026-09-14 背景: 魔塔 list_repo_files 对个别文件(实测 chat_template.jinja /
+    generation_config.json)不返回 sha256, 而是把 **40 位 git blob sha1** 填进 sha256
+    字段(与 blob_id 同值)。跨端比对若把 40 位当 sha256 与魔乐本地 64 位 sha256 比,
+    必然"不一致" → 每次全量核验刷出成片 rehash_mismatch 误报(生产 21 条)。现统一在
+    跨端比较处校验长度/字符集; 同长形态(40 位)则与魔乐 blob_id 比(同为 git 对象 id)。
+    """
+    if not isinstance(v, str):
+        return False
+    v = v.strip().lower()
+    return len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+
+
 def _enqueue(conn, org_id: str, kind: str, model: str, direction: str | None = None,
              priority: int = tasks.PRIORITY_NORMAL) -> bool:
     _, created = tasks.enqueue_task(conn, org_id, kind, model,
@@ -447,7 +462,14 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
         if row_m is None:
             continue
         s_sha = cur_scope[path].get("sha256") or None
+        if s_sha and not _is_sha256(s_sha):
+            # 2026-09-14: 魔塔对个别文件不返回内容 sha256, 而是回退成 40 位 git blob sha1
+            # (实测 chat_template.jinja / generation_config.json, 与魔乐 blob_id 一致)。
+            # 这种形态不能当内容 sha256 与魔乐本地 sha256 比 → 视为"无可比 sha256", 跳过。
+            s_sha = None
         m_sha = cur_modelers[path].get("sha256") or None
+        if m_sha and not _is_sha256(m_sha):
+            m_sha = None
         if not m_sha and row_m["sha256_source"] == "local":
             m_sha = row_m["sha256"] or None       # 魔乐非 LFS: 用强哈希 local 基线
         if not s_sha or not m_sha:
@@ -901,7 +923,7 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
     """
     now = now or _now()
     stat = {"checked": 0, "mismatch": 0, "ok": 0, "skipped_big": 0, "done": False,
-            "failed": 0, "retry_only": False}
+            "failed": 0, "retry_only": False, "skipped_form": 0}
     interval_d = int(db.get_app_config(conn, org.id, "sync.forced_rehash_interval_d", 30))
     last = db.get_app_config(conn, org.id, "sync.last_forced_rehash", 0) or 0
     batch = int(db.get_app_config(conn, org.id, "sync.forced_rehash_batch", 800))
@@ -991,7 +1013,15 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
             if not had_sha:
                 # B) 首次建立本地基线, 并交叉比对魔塔
                 s_sha = _scope_sha(r)
-                if s_sha and s_sha != h:
+                if s_sha and not _is_sha256(s_sha):
+                    # 魔塔该文件没给内容 sha256(实测回退成 40 位 git blob sha1, 与魔乐
+                    # blob_id 同源) → 不能与本地 sha256 比: 同源 blob 相等即同内容;
+                    # 都无法比较则只计数不告警(2026-09-14 修复成片误报)。
+                    if s_sha == (r["blob_id"] or ""):
+                        stat["ok"] += 1
+                    else:
+                        stat["skipped_form"] += 1
+                elif s_sha and s_sha != h:
                     _alert_mismatch(r, f"魔塔 {s_sha[:16]}… vs 实际 {h[:16]}…")
                 else:
                     stat["ok"] += 1
@@ -1003,7 +1033,8 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
                     stat["ok"] += 1
             if stat["checked"] % 50 == 0:
                 pmsg = (f"强哈希分批: 本轮已核对 {stat['checked']} (轮内上限 {batch}), "
-                        f"一致={stat['ok']} 不一致={stat['mismatch']} 失败={stat['failed']}")
+                        f"一致={stat['ok']} 不一致={stat['mismatch']} 失败={stat['failed']} "
+                        f"跳过(魔塔非sha256)={stat['skipped_form']}")
                 print(f"[reconcile] {org.id} {pmsg}", flush=True)
                 db.set_runtime_state(conn, org.id, "sync.rehash_progress", pmsg)
                 db.touch_heartbeat(conn, None)
@@ -1038,7 +1069,9 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
                 (org.id,)).fetchall():
             stat["checked"] += 1
             s_sha = _scope_sha(r)
-            if s_sha and s_sha != r["sha256"]:
+            if s_sha and not _is_sha256(s_sha):
+                stat["skipped_form"] += 1        # 魔塔非 sha256 形态(40 位 blob): 不可比
+            elif s_sha and s_sha != r["sha256"]:
                 _alert_mismatch(r, f"魔塔 {s_sha[:16]}… vs 魔乐 {r['sha256'][:16]}…")
             else:
                 stat["ok"] += 1
@@ -1056,7 +1089,8 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
     _commit(conn)
     rh_msg = (f"强哈希{'完成' if stat['done'] else ('重试轮' if stat.get('retry_only') else '分批进行中')}: "
               f"本轮核对={stat['checked']} 一致={stat['ok']} 不一致={stat['mismatch']} "
-              f"失败={stat['failed']} 跳过(>50MB)={stat['skipped_big']} 轮内上限={batch}")
+              f"失败={stat['failed']} 跳过(>50MB)={stat['skipped_big']} "
+              f"跳过(魔塔非sha256)={stat['skipped_form']} 轮内上限={batch}")
     print(f"[reconcile] {org.id} {rh_msg}", flush=True)
     db.set_runtime_state(conn, org.id, "sync.rehash_progress", rh_msg)
     return stat
@@ -1127,6 +1161,7 @@ def scheduler_tick(conn, orgs, now: int | None = None, force: bool = False) -> l
             if needs_full and missing:
                 r_rehash = {"checked": 0, "mismatch": 0, "ok": 0, "skipped_big": 0,
                             "done": False, "failed": 0, "retry_only": False,
+                            "skipped_form": 0,
                             "skipped_reason": f"文件基线未建全({len(missing)} 个模型待建), "
                                               f"强哈希本轮跳过"}
                 print(f"[reconcile] {org.id} {r_rehash['skipped_reason']}: "

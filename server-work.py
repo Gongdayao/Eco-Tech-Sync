@@ -333,7 +333,8 @@ def cmd_daemon(args) -> int:
                           f"独有={f.get('extra')} 入队={f.get('file_batch_enq')} "
                           f"已核验回写={f.get('verified')} | "
                           f"强哈希: 核对={rh.get('checked')} 不一致={rh.get('mismatch')} "
-                          f"失败={rh.get('failed')} 完成={rh.get('done')}"
+                          f"失败={rh.get('failed')} 跳过(魔塔非sha256)={rh.get('skipped_form')} "
+                          f"完成={rh.get('done')}"
                           + (f" 跳过={rh.get('skipped_reason')}" if rh.get("skipped_reason") else ""))
         except Exception as e:
             print(f"[daemon] scheduler_tick 异常: {type(e).__name__}: {e}")
