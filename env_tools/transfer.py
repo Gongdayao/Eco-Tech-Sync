@@ -370,6 +370,59 @@ def _refresh_baselines(conn, org, model: str, now: int | None = None) -> None:
     conn.commit()
 
 
+def repo_last_modified(org, platform: str, model: str) -> int | None:
+    """单仓 last_modified(与各自 model_list 同源同值; epoch 秒), 取不到 → None。
+
+    2026-09-14 调度重构: 队列生成阶段只拉 model_list 并用 last_modified 判"该 repo 是否
+    有文件级变动"; 任务执行阶段核验完成后, 用本函数把**该仓当前版本**回写为"已核验"
+    (models.files_verified_lm) —— 必须用同一来源的值, 否则两侧永远判不相等。
+      魔塔: HubApi.get_model(repo_id)['UpdatedAt'](ISO; 实测与列表值逐秒一致)
+      魔乐: model_info(repo_id).last_modified(epoch; 实测与列表值完全一致)
+    异常/取不到 → None: 调用方保持 dirty(宁可下轮多扫一次, 不漏变更)。
+    """
+    repo_id = _repo_id(org, platform, model)
+    try:
+        global_limiter.wait()
+        if platform == "scope":
+            mo = _scope_api(org).get_model(repo_id, revision="master")
+            raw = mo.get("UpdatedAt") if isinstance(mo, dict) else _get(mo, "UpdatedAt", None)
+            return _to_epoch(raw)
+        from openmind_hub import model_info
+        mi = model_info(repo_id, token=org.modelers.token)
+        raw = _get(mi, "last_modified", None) if not isinstance(mi, dict) else mi.get("last_modified")
+        return _to_epoch(raw)
+    except Exception as e:
+        print(f"[transfer] 读取 {platform}/{model} last_modified 失败: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def record_files_verified(conn, org, model: str, scope_lm: int | None = None,
+                          modelers_lm: int | None = None) -> dict:
+    """把"该侧文件树已核验"的仓版本写入 models.files_verified_lm(v8, 2026-09-14)。
+
+    **只在核验成功时调用**: 采纳/无差异的 diff 之后, 或同步/删除成功之后。
+    未传入的一侧现取(repo_last_modified); 取不到则保持原值(下轮继续 dirty)。
+    """
+    out: dict = {}
+    if scope_lm is None:
+        scope_lm = repo_last_modified(org, "scope", model)
+    if modelers_lm is None:
+        modelers_lm = repo_last_modified(org, "modelers", model)
+    for plat, lm in (("scope", scope_lm), ("modelers", modelers_lm)):
+        if lm is None:
+            continue
+        conn.execute(
+            "UPDATE models SET files_verified_lm=? WHERE org=? AND platform=? AND repo_id=?",
+            (int(lm), org.id, plat, _repo_id(org, plat, model)))
+        out[plat] = int(lm)
+    conn.commit()
+    if out:
+        print(f"[transfer] {model} 已核验仓版本回写: "
+              + " ".join(f"{k}={v}" for k, v in sorted(out.items())), flush=True)
+    return out
+
+
 def _stage_readme(conn, org, dst_platform: str, model: str, src_text: str,
                   stage_dir: str) -> None:
     """README 走管线变换后落盘到上传暂存目录。"""
@@ -553,6 +606,8 @@ def sync_model(conn, org, task) -> dict:
 
     # 5) 校验 + 6) 回写基线(含 last_synced_at 标记目标侧)
     _refresh_baselines(conn, org, model, now)
+    # 模型级同步完成 = 该仓文件树此刻已同步 → 回写"已核验仓版本"(v8, 见 record_files_verified)
+    record_files_verified(conn, org, model)
     synced = [p for p in paths]
     if readme is not None:
         synced.append("README.md")
@@ -616,7 +671,18 @@ def sync_files(conn, org, task) -> dict:
     if d["abort"]:
         return {"ok": True, "note": "魔塔文件集拉取失败/为空, 本轮跳过(防误删)"}
     if d["adopt"]:
-        return {"ok": True, "note": "采纳模式, 无任务动作"}
+        # 采纳模式(首次为该仓建两侧基线): 先跑 README 四分支(建 is_init 标记, 可能判定
+        # "魔乐 init README 需用魔塔版覆盖"), 再**重算一次 diff** —— 此时基线已落库,
+        # 走正常差异流程(README 覆盖在本任务内完成), 而不是把活留给下一轮
+        # (2026-09-14 调度重构: 本任务很可能就是"无基线"入队的那一个)。
+        from env_tools import reconcile as _rc
+        _rc._adopt_readme_check(conn, org, model, d, {"file_batch_enq": 0})
+        d = compute_file_diff(conn, org, model, now)
+        if d["abort"]:
+            return {"ok": True, "note": "采纳后复核: 魔塔文件集拉取失败/为空, 本轮跳过"}
+        if d["adopt"]:
+            record_files_verified(conn, org, model)
+            return {"ok": True, "note": "采纳模式, 无任务动作"}
 
     # 1) 上传集(魔塔当前版纠正魔乐): 新增 + 同名覆盖 → 一次 commit 上传
     #    (先上传后删除 —— 任务执行窗口内魔乐只会"多文件"不会"缺文件")
@@ -704,6 +770,9 @@ def sync_files(conn, org, task) -> dict:
                   total_bytes=sum(sizes.values()))
 
     _refresh_baselines(conn, org, model, now)
+    # 文件级同步成功 → 该仓两侧文件树此刻与基线一致 → 回写"已核验仓版本"(v8):
+    # 队列生成阶段据此判 dirty, 失败路径不会走到这里(异常向上抛 → 任务失败 → 保持 dirty)
+    record_files_verified(conn, org, model)
     if uploaded:
         _mark_synced(conn, org.id, "modelers", _repo_id(org, "modelers", model), uploaded, now)
     return {"ok": True, "deleted": len(dels), "uploaded": len(uploaded)}

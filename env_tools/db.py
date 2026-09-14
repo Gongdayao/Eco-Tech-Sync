@@ -24,6 +24,13 @@ SCHEMA_VERSION 7 变更(2026-09-14): files 增加 rehash_fail_count / rehash_nex
 强哈希下载失败的**退避**记录: 失败不再每轮重选(失败计数 + 下次重试时间, 指数退避上限 7d);
 另新增 set_app_config() upsert, 修 `sync.last_reconcile` / `sync.last_forced_rehash` 两个
 时间戳误用 seed_app_config(INSERT OR IGNORE)导致"只写一次、之后永不更新"的缺陷。
+
+SCHEMA_VERSION 8 变更(2026-09-14, 对账调度重构): models 增加 files_verified_lm ——
+**该侧仓上"已核验过文件树"的 last_modified**。队列生成阶段只拉两侧 model_list,
+用 `cur.last_modified != files_verified_lm` 判断该 repo 是否有文件级变动并入队 file_batch;
+真正的文件级比对(魔塔 1 次 list_repo_files + 魔乐 1 次 list_repo_tree)放到任务执行时按
+单仓做; 核验成功(无差异或同步成功)才回写该值 → 失败自动保持 dirty、下轮重入队。
+首次部署 / `audit --force` 仍走全量扫描(此时该列为 NULL = 全部 dirty)。
 """
 import os
 import sqlite3
@@ -33,7 +40,7 @@ import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "sync.db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 TASKS_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -104,6 +111,7 @@ CREATE TABLE IF NOT EXISTS models (
   missing_since INTEGER,                           -- 模型级删除宽限期计时
   gitcode_status TEXT,                             -- NULL/pending/imported/failed/skipped
   gitcode_checked_at INTEGER,
+  files_verified_lm INTEGER,                       -- v8: 已核验文件树的那一版仓 last_modified
   PRIMARY KEY (org, platform, repo_id)
 );
 CREATE INDEX IF NOT EXISTS idx_models_fingerprint ON models (org, platform, last_modified);
@@ -233,6 +241,7 @@ def _ensure_known_columns(conn: sqlite3.Connection) -> None:
         ("files", "blob_id", "blob_id TEXT"),
         ("files", "is_init", "is_init INTEGER NOT NULL DEFAULT 0"),
         ("files", "last_synced_at", "last_synced_at INTEGER"),
+        ("models", "files_verified_lm", "files_verified_lm INTEGER"),
         ("files", "rehash_checked_at", "rehash_checked_at INTEGER"),
         ("files", "rehash_fail_count", "rehash_fail_count INTEGER NOT NULL DEFAULT 0"),
         ("files", "rehash_next_try_at", "rehash_next_try_at INTEGER"),
@@ -288,6 +297,13 @@ def migrate(db_path: str | None = None) -> None:
             #   poison 已标记(platform/poison)的行 + 旧规则时期 poison=NULL 的
             #   隐藏路径行(任一路径段以 '.' 开头)。一次性, 幂等。
             _cleanup_hidden_rows(conn)
+        if current < 8:
+            # v8(2026-09-14): 调度重构引入 models.files_verified_lm(队列生成靠它判 dirty)。
+            # 升级回填: 已有文件基线的仓 = 旧实现刚全量比对过 → 直接以当前 last_modified
+            # 视为"已核验", 避免升级后第一轮把全部仓再扫一遍(无基线的仍为 NULL → dirty)。
+            n = _backfill_files_verified(conn)
+            if n:
+                print(f"[db] v8 回填 models.files_verified_lm: {n} 行(已有文件基线视为已核验)")
         if current < SCHEMA_VERSION:
             conn.execute("INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?,?)",
                          (SCHEMA_VERSION, int(time.time())))
@@ -313,6 +329,20 @@ def _cleanup_hidden_rows(conn: sqlite3.Connection) -> None:
             n += 1
     if n:
         print(f"[db] v4 清理隐藏/毒瘤历史文件行: {n}")
+
+
+def _backfill_files_verified(conn: sqlite3.Connection) -> int:
+    """v8 一次性回填: 有文件基线的 models 行 → files_verified_lm = 当前 last_modified。
+
+    语义 = "这个仓的文件树旧实现已经全量比对过"(升级前那一轮刚扫过), 因此不必再扫一遍;
+    没有 files 行的模型保持 NULL → 仍会被判 dirty, 由任务执行时采纳建基线。
+    """
+    cur = conn.execute(
+        "UPDATE models SET files_verified_lm = last_modified "
+        "WHERE files_verified_lm IS NULL AND EXISTS ("
+        "  SELECT 1 FROM files f WHERE f.org = models.org AND f.platform = models.platform "
+        "    AND f.repo_id = models.repo_id)")
+    return cur.rowcount or 0
 
 
 def seed_app_config(conn: sqlite3.Connection, org_id: str, defaults: dict) -> None:

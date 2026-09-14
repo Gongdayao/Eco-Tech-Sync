@@ -4,6 +4,8 @@
 *.pem
 *.key
 
+.git/
+
 sync.db*
 tests/
 

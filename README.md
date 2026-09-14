@@ -122,13 +122,22 @@ python server-work.py status --json | python -m json.tool   # 美化/校验 JSON
 python server-work.py daemon
 ```
 
-⚠ 关键时序: **空库第一次 audit 只做"采纳"**(按两侧现状建基线, 不产生文件级增删改任务);
-**第二轮对账**(daemon 下一个空闲 tick, 或间隔 ≥15 分钟再跑一次 audit)才按差异入队 file_batch:
-魔塔缺/改/删 → 自动同步; 跨端同名不一致 → 以魔塔版覆盖; 魔乐独有 → 严格镜像自动删
-(关闭 `sync.auto_delete_extra` 时改为 `delete_manual` 告警 + `clean` 人工处理)。
-
-首轮采纳期间逐模型拉双侧文件树 + 强哈希分批(每轮上限 `forced_rehash_batch`), 可能持续
-数十分钟——有进度日志与 `status` 运行状态可看(见 5.3 / 5.11), 不是卡死。
+⚠ 关键时序(2026-09-14 调度重构后):
+- **首次部署/空库: 第一轮就是"全量"** —— 逐模型拉双侧文件树建基线(采纳)、写
+  `models.files_verified_lm`, 然后强哈希分批建 sha256 基线(每轮上限 `forced_rehash_batch`);
+  可能持续数十分钟, 有进度日志与 `status` 运行状态可看(见 5.3 / 5.11), 不是卡死。
+  全量只在"库中尚无任何魔塔文件基线"或 `audit --force` 时发生。
+- **此后每 15 分钟一轮只做轻量排查**: 拉一次两侧 model_list(魔塔分页 ~4 次 + 魔乐 1 次),
+  逐模型比仓级 `last_modified` 与 `files_verified_lm` → 有变动的仓**直接入队 file_batch**;
+  日常轮次**不拉任何文件树**(实测 176 个在管模型: 1.5s、0 次文件树请求)。
+- **文件级怎么同步由任务执行时决定**: worker 针对该单仓做二次比对
+  (魔塔 1 次 `list_repo_files` + 魔乐 1 次 `list_repo_tree`, 含每文件 sha256/blob_id),
+  与基线比对后生成增/删/改动作; 魔塔缺/改/删 → 自动同步; 跨端同名不一致 → 以魔塔版覆盖;
+  README 正文不一致 → 以魔塔版覆盖; 魔乐独有 → 严格镜像自动删(关闭 `sync.auto_delete_extra`
+  时改为 `delete_manual` 告警 + `clean` 人工处理)。
+- **魔乐侧有变动 = 该仓文件被改/破坏** → 同样入队, 由 worker 以魔塔版强制恢复(魔乐侧
+  只考虑"被破坏需恢复"这一种情况; 用户手操的文件级更新一律引导到魔塔侧做)。
+- 任务完成后回写 `files_verified_lm`; 任务失败则不回写 → 保持 dirty, 下一轮自动重新入队。
 
 ### 5.2 enqueue — 手动入队
 
@@ -272,7 +281,7 @@ python server-work.py audit --org Eco-Tech --force
 daemon 本身恒受节流, 不受 `--force` 影响。**被跳过时连 GitCode 全量补齐也一并跳过**
 (`--force` 或窗口过期才跑), 避免"跳过"只跳一半。
 
-内容:模型级矩阵 + 文件级纠正器 + 强哈希(首次全量核验: LFS 零下载交叉比对 + 非 LFS ≤50MB 下载建 sha256 基线, 之后每 30d 复核; 分批 forced_rehash_batch, 零大文件下载; 周期标记 `sync.last_forced_rehash`/节流标记 `sync.last_reconcile` 一律走 upsert 写入(2026-09-14 修复: 旧实现用 seed_app_config=INSERT OR IGNORE, 只写一次 → 周期与节流双双失效); 周期边界按 `rehash_checked_at <= cycle_start`(否则分多轮完成时最后一轮那批永不复核、前几轮反被重下); 失败行按 `rehash_fail_count`/`rehash_next_try_at` 指数退避(6h 倍增, 上限 7d; 退避到期由"纯重试轮"跟进, 不受 30d 闸门阻挡);**README.md 不参与强哈希跨端比对**——魔乐版是 README 管线变换产物, 裸 sha256 必然不同; 正文一致性由对账轮单独校验并自动纠正)+
+内容(2026-09-14 调度重构):模型级矩阵 + **队列生成(仅拉两侧 model_list, 按仓级 last_modified 入队 file_batch)** + 文件级全量对账(**仅首次部署/`--force`**, 日常由任务执行时按单仓比对) + 强哈希(首次全量核验: LFS 零下载交叉比对 + 非 LFS ≤50MB 下载建 sha256 基线, 之后每 30d 复核; 分批 forced_rehash_batch, 零大文件下载; 周期标记 `sync.last_forced_rehash`/节流标记 `sync.last_reconcile` 一律走 upsert 写入(2026-09-14 修复: 旧实现用 seed_app_config=INSERT OR IGNORE, 只写一次 → 周期与节流双双失效); 周期边界按 `rehash_checked_at <= cycle_start`(否则分多轮完成时最后一轮那批永不复核、前几轮反被重下); 失败行按 `rehash_fail_count`/`rehash_next_try_at` 指数退避(6h 倍增, 上限 7d; 退避到期由"纯重试轮"跟进, 不受 30d 闸门阻挡);**README.md 不参与强哈希跨端比对**——魔乐版是 README 管线变换产物, 裸 sha256 必然不同; 正文一致性由对账轮单独校验并自动纠正)+
 GitCode 全量补齐(scan_and_fill,若有 gitcode 配置)。只读平台 + 入队,不执行任务。
 
 ⚠ 空库首轮 audit = 采纳(建基线, 不产生文件级增删改任务); **第二轮**才按差异入队(见 5.1)。
@@ -356,7 +365,7 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | 准入 | repo 至少一个 `.safetensors` 才管理;魔塔 list 为准(魔塔对非权重 repo 隐身) |
 | 模型级新增 | 魔塔新增(有权重非 gated)→ 同步魔乐;魔乐独有权重 → 反向建塔(可见性参考魔乐);魔塔隐身存在 → 略过+告警一次 |
 | 模型级删除 | 魔塔 repo 消失(**模型级宽限 3 轮**, DB 曾有权重)→ 删魔乐 repo(无护栏)+ GitCode 对齐 + 清双侧行;魔塔本体人工网页删;魔乐缺 → 即时补齐 |
-| 文件级 | 魔塔为准单向:增/改/魔乐缺(有基线行)→整批同步魔乐;**魔塔删 → 同轮整批删(无宽限, 对齐 v1: 先上传后删除)**;魔乐独有→**严格镜像自动删**(`auto_delete_extra=true`;关闭后为人工确认);不一致→魔塔版覆盖(**含跨端同名内容不一致**, 2026-09: 魔塔 sha256 vs 魔乐 sha256/LFS/local 基线, README 除外, 自动以魔塔版覆盖 + content_mismatch 告警)。存量缺失(魔乐基线无行且树上无)2026-09 起自动补(人工排查确认属纯缺失, 含整目录 TP1/t2v/optional; 子目录路径保真同步) |
+| 文件级 | 调度(2026-09-14):队列生成只拉两侧 model_list, 仓级 `last_modified` 与 `models.files_verified_lm` 不一致即入队 file_batch(零文件树请求); 单仓的逐文件比对在任务执行时做。魔塔为准单向:增/改/魔乐缺(有基线行)→整批同步魔乐;**魔塔删 → 同轮整批删(无宽限, 对齐 v1: 先上传后删除)**;魔乐独有→**严格镜像自动删**(`auto_delete_extra=true`;关闭后为人工确认);不一致→魔塔版覆盖(**含跨端同名内容不一致**, 2026-09: 魔塔 sha256 vs 魔乐 sha256/LFS/local 基线, README 除外, 自动以魔塔版覆盖 + content_mismatch 告警)。存量缺失(魔乐基线无行且树上无)2026-09 起自动补(人工排查确认属纯缺失, 含整目录 TP1/t2v/optional; 子目录路径保真同步) |
 | gated | 三态:魔乐无→静默;魔乐隐藏→不管;魔乐公开→critical 告警;转换检测(私有→gated warn 等) |
 | 可见性 | 魔塔为主,每轮对比;魔乐 API 无法改 → 告警人工 |
 | README | 2026-09 规则:魔塔**无 README** = 空白 → 不同步、不删魔乐 README、不告警;**不参与跨端同名内容比对与强哈希核对**(front matter/license 归一化导致裸哈希必然不同);**正文一致性单独校验**:每轮剥离 front matter 比正文, 不一致 → 自动以魔塔版覆盖魔乐 + `readme_body_mismatch` 留痕告警(每模型下载两侧 README 小文件比对; 已在待同步集则跳过);比较口径(2026-09-14):front matter 块**前后空行容忍**(兼容首行空行/BOM/CRLF)、正文取"第一行非空行 ~ 最后一行非空行"(**首尾空行容忍**), **正文内部空行与排版差异不容忍**(不逐行 rstrip、不折叠内部空行)——避免"首行空行致剥头失败→每轮空转"与"元数据被当正文写进目标卡片"两类问题;魔塔 init(空/模板)不同步;real → 变换同步魔乐(双向模型级上传前判 init, init 不传);魔乐 README 永不因独有删除;license 由建仓参数从魔塔元数据兜底传递 |
@@ -380,7 +389,8 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 - 关键列:`tasks.progress/started_at`(执行进度/领取时刻)、`files.blob_id`(魔乐非 LFS 变更指纹)、
   `files.rehash_checked_at`(强哈希周期内已核验标记)、`files.rehash_fail_count`/
   `files.rehash_next_try_at`(强哈希失败计数与下次重试时间, 指数退避)、`files.sha256_source`(`api`/`local`/`none`)、
-  `files.last_synced_at`(同步滞后);
+  `files.last_synced_at`(同步滞后)、`models.files_verified_lm`(v8: 该侧仓"已核验文件树"的
+  last_modified, 队列生成据此判 dirty; 任务成功后回写, 失败保持 dirty 下轮重入队);
 - 运行状态键:`app_config` 的 `sync.reconcile_progress` / `sync.rehash_progress`(供 `status` 展示);
 - 隐藏/毒瘤文件在 fetch 源头过滤、不落库(v4 迁移已清理历史遗留行);
 - **启动即 `migrate()`**(幂等): 补齐缺失的追加列(与版本号解耦)、按需重建 tasks、执行一次性数据迁移;

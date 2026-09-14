@@ -100,7 +100,10 @@ def model_level(conn, org, now: int | None = None) -> dict:
     # gated(审批)权重一律过滤: 不入队/不告警/文件级不管(用户定稿 2026-09)
     gated_names = {m["name"] for m in scope_list if m.get("gated")}
     stat["skip_gated"] = len(gated_names)
-    stat["seen"] = {"scope": scope_names, "modelers": modelers_names}
+    # seen 供后续阶段复用本轮 list(避免重复请求); _lm 两份映射供"队列生成/全量核验回写"用
+    stat["seen"] = {"scope": scope_names, "modelers": modelers_names,
+                    "scope_lm": {m["name"]: m.get("last_modified") for m in scope_list},
+                    "modelers_lm": {m["name"]: m.get("last_modified") for m in modelers_list}}
 
     scope_by_name = {m["name"]: m for m in scope_list}
     modelers_by_name = {m["name"]: m for m in modelers_list}
@@ -551,17 +554,29 @@ def _actionable_split(conn, org, model: str, d: dict, now: int) -> dict:
     return {"run": run, "manual": manual}
 
 
-def file_level(conn, org, now: int | None = None, seen: dict | None = None) -> dict:
-    """文件级单向对账: 处理对象 = 魔塔在管 repo(DB 魔塔行 + 魔塔当前 list 在)。
+def file_level(conn, org, now: int | None = None, seen: dict | None = None,
+               full: bool = False) -> dict:
+    """文件级【全量模式】对账: 逐模型拉两侧文件树比对(仅首次部署 / `audit --force` 调用)。
 
-    入队只发生在 worker 真正有动作时(_actionable_split, 2026-09 空转修复):
-    受删除保护的 extra 不驱动入队(worker 执行也是空转), 改为对账侧一次性告警
-    (delete_manual 前缀, 按模型去重); missing_scope(魔塔已删)无宽限, 直接可执行。
+    2026-09-14 调度重构: 日常 15min 轮次**不做**这个(见 file_enqueue_from_lists)——
+    队列生成只拉两侧 model_list, 用仓级 last_modified 判"该 repo 是否有文件级变动"并入队;
+    真正的文件树比对放到任务执行时按单仓做。本函数只保留"全量"职责:
+      - 首次部署(尚无任何魔塔文件基线)或 `audit --force`: 逐模型建基线 + 全量比对;
+      - 核验干净的模型(采纳 / 无待办)在此回写 `models.files_verified_lm`;
+      - 有待办的模型不回写(等 worker 跑完再回写), 失败即保持 dirty 下轮重入队。
+    入队规则与历史一致: 只 在 worker 真正有动作时入队(_actionable_split)。
+
+    逐模型明细会落日志(初始部署是敏感期, 用户要求"文件和模型级增删改都有清楚 log")。
     """
     now = now or _now()
-    stat = {"checked": 0, "adopted": 0, "aborted": 0, "to_correct": 0, "extra": 0,
-            "file_batch_enq": 0, "to_delete": 0, "manual_extra": 0,
-            "readme_body_mismatch": 0}
+    if not full:
+        # 轻量轮: 本阶段无文件树请求(队列生成阶段已按 last_modified 入队)
+        return {"mode": "light", "checked": 0, "adopted": 0, "aborted": 0, "to_correct": 0,
+                "extra": 0, "file_batch_enq": 0, "to_delete": 0, "manual_extra": 0,
+                "readme_body_mismatch": 0}
+    stat = {"mode": "full", "checked": 0, "adopted": 0, "aborted": 0, "to_correct": 0,
+            "extra": 0, "file_batch_enq": 0, "to_delete": 0, "manual_extra": 0,
+            "readme_body_mismatch": 0, "verified": 0}
     if seen is None:
         s = {m["name"] for m in fetch_remote_models(conn, org, "scope")} if org.scope.configured else set()
     else:
@@ -574,11 +589,12 @@ def file_level(conn, org, now: int | None = None, seen: dict | None = None) -> d
     # 打一条进度并刷新心跳(只刷时间不覆盖 pid), 避免 journal 静默 + 心跳停滞误判。
     total = len(managed)
     t0 = _now()
-    print(f"[reconcile] {org.id} 文件级开始: 在管模型 {total} 个", flush=True)
-    db.set_runtime_state(conn, org.id, "sync.reconcile_progress", f"文件级 0/{total} 开始")
+    print(f"[reconcile] {org.id} 文件级全量开始: 在管模型 {total} 个"
+          f"(首次部署/--force; 日常轮次由队列生成按 last_modified 入队)", flush=True)
+    db.set_runtime_state(conn, org.id, "sync.reconcile_progress", f"文件级全量 0/{total} 开始")
     for i, model in enumerate(managed, 1):
         if i % 20 == 0:
-            msg = (f"文件级 {i}/{total} (检查={stat['checked']} 上传={stat['to_correct']} "
+            msg = (f"文件级全量 {i}/{total} (检查={stat['checked']} 上传={stat['to_correct']} "
                    f"待删={stat['to_delete']} 独有={stat['extra']} 入队={stat['file_batch_enq']}) "
                    f"耗时 {_now() - t0}s")
             print(f"[reconcile] {org.id} {msg}", flush=True)
@@ -587,15 +603,24 @@ def file_level(conn, org, now: int | None = None, seen: dict | None = None) -> d
         try:
             d = compute_file_diff(conn, org, model, now)
         except Exception as e:
-            print(f"[reconcile] {org.id}/{model} 文件对账异常: {type(e).__name__}: {e}")
+            print(f"[reconcile] {org.id}/{model} 文件对账异常: {type(e).__name__}: {e}", flush=True)
             continue
         if d["abort"]:
             stat["aborted"] += 1
+            print(f"[reconcile] {org.id} 跳过(拉取失败) {model}: 魔塔文件集拉取失败/为空, 不动作",
+                  flush=True)
             continue
         stat["checked"] += 1
         if d["adopt"]:
             stat["adopted"] += 1
+            enq_before = stat["file_batch_enq"]
             _adopt_readme_check(conn, org, model, d, stat)
+            print(f"[reconcile] {org.id} 采纳 {model}: 建立两侧文件基线"
+                  + ("(README 需覆盖, 已入队)" if stat["file_batch_enq"] > enq_before else "(不动作)"),
+                  flush=True)
+            if stat["file_batch_enq"] == enq_before:
+                _record_verified(conn, org, model, seen)   # 无待办才回写; 有任务则由 worker 回写
+                stat["verified"] += 1
             continue
         _readme_isinit_confirm(conn, org, model, d, stat, now)
         act = _actionable_split(conn, org, model, d, now)
@@ -614,15 +639,126 @@ def file_level(conn, org, now: int | None = None, seen: dict | None = None) -> d
                         + ("..." if len(act["manual"]) > 10 else "")
                         + f" | 确认后执行: python server-work.py clean --org {org.id} "
                           f"--model {model} --yes")
+        if d["to_modelers"] or d["missing_scope"] or act["manual"]:
+            print(f"[reconcile] {org.id} 差异 {model}: 待同步={len(d['to_modelers'])} "
+                  f"待删={len(d['missing_scope'])} 魔乐独有={len(d['extra'])} "
+                  f"人工确认={len(act['manual'])}"
+                  + (f" | 待同步文件: {', '.join(sorted(d['to_modelers'])[:5])}"
+                     + ("..." if len(d["to_modelers"]) > 5 else "") if d["to_modelers"] else "")
+                  + (f" | 待删文件: {', '.join(sorted(d['missing_scope'])[:5])}"
+                     + ("..." if len(d["missing_scope"]) > 5 else "") if d["missing_scope"] else ""),
+                  flush=True)
         if act["run"] and _enqueue(conn, org.id, tasks.KIND_FILE_BATCH, model, "to_modelers"):
             stat["file_batch_enq"] += 1
+        else:
+            # 无待办(或仅有受保护 extra)→ 两侧文件树此刻与基线一致 → 回写"已核验仓版本"
+            _record_verified(conn, org, model, seen)
+            stat["verified"] += 1
     _commit(conn)
-    done_msg = (f"文件级完成 {stat['checked']}/{total} 耗时 {_now() - t0}s | "
+    done_msg = (f"文件级全量完成 {stat['checked']}/{total} 耗时 {_now() - t0}s | "
                 f"采纳={stat['adopted']} 跳过(拉取失败)={stat['aborted']} 上传={stat['to_correct']} "
                 f"待删={stat['to_delete']} 独有={stat['extra']} 人工={stat['manual_extra']} "
-                f"README正文不一致={stat['readme_body_mismatch']} 入队={stat['file_batch_enq']}")
+                f"README正文不一致={stat['readme_body_mismatch']} 入队={stat['file_batch_enq']} "
+                f"已核验回写={stat['verified']}")
     print(f"[reconcile] {org.id} {done_msg}", flush=True)
     db.set_runtime_state(conn, org.id, "sync.reconcile_progress", done_msg)
+    return stat
+
+
+def _record_verified(conn, org, model: str, seen: dict | None) -> None:
+    """回写"已核验仓版本"(全量模式用): 优先用本轮 model_list 的值(零额外请求)。
+
+    缺值时**不静默跳过**, 交给 record_files_verified 现取单仓 last_modified ——
+    静默不写会让该仓永远 dirty、每轮重复入队(2026-09-14 复查)。
+    """
+    from env_tools import transfer
+    lm_s = (seen or {}).get("scope_lm", {}).get(model)
+    lm_m = (seen or {}).get("modelers_lm", {}).get(model)
+    transfer.record_files_verified(conn, org, model, scope_lm=lm_s, modelers_lm=lm_m)
+
+
+def file_enqueue_from_lists(conn, org, now: int | None = None, seen: dict | None = None) -> dict:
+    """【队列生成】只用两侧 model_list 判定文件级变动并入队(2026-09-14 调度重构)。
+
+    设计(用户定稿): 日常 15min 排查只做最简单操作 —— 拉一次两侧 model_list, 逐个比较:
+      - 模型级增/删 → 模型级任务(在 model_level 里做);
+      - 文件级: 该 repo 的仓级 `last_modified` 与"已核验版本"(files_verified_lm, v8)不一致
+        → 说明这一侧仓内有文件被增/删/改 → 直接入队 file_batch(to_modelers)。
+    真正的"哪些文件要增删改"由任务执行时针对单个 repo 二次比对(魔塔 1 次 list_repo_files +
+    魔乐 1 次 list_repo_tree), 因此本函数**不发起任何文件树请求**。
+
+    - 两侧任一不一致(或从未核验)→ dirty; 魔乐侧变动按"文件级以魔塔为准强制同步"处理
+      (worker 会以魔塔版覆盖/删除, 即"帮魔乐恢复")。
+    - 已有该模型的非终态任务 → 跳过入队: 任务执行时会重算 diff, 必然覆盖本次变动
+      (任务租约本就按模型串行); 也避免模型级任务与文件级任务重复干活。
+    - 魔塔无文件基线的模型跳过(交给模型级 model_sync / 首次全量采纳流程)。
+    """
+    now = now or _now()
+    stat = {"managed": 0, "dirty": 0, "enq": 0, "clean": 0, "skip_pending": 0,
+            "skip_gated": 0, "dirty_nobaseline": 0, "dirty_names": []}
+    if not seen:
+        return stat
+    names = set(seen.get("scope", set())) & set(seen.get("modelers", set()))
+    if not names:
+        return stat
+    rows = conn.execute(
+        "SELECT platform, name, last_modified, files_verified_lm, gated FROM models "
+        "WHERE org=? AND platform IN ('scope','modelers')", (org.id,)).fetchall()
+    sc = {r["name"]: r for r in rows if r["platform"] == "scope"}
+    mo = {r["name"]: r for r in rows if r["platform"] == "modelers"}
+    # 以**本轮 model_list 的仓级 last_modified** 为准(model_level 刚拉到; DB 行仅兜底),
+    # 比较对象是"已核验版本" files_verified_lm(v8)
+    lm_s = {k: v for k, v in (seen.get("scope_lm") or {}).items() if v is not None}
+    lm_m = {k: v for k, v in (seen.get("modelers_lm") or {}).items() if v is not None}
+    baseline = {r["repo_id"].split("/", 1)[1] for r in conn.execute(
+        "SELECT DISTINCT repo_id FROM files WHERE org=? AND platform='scope'", (org.id,))
+        if "/" in r["repo_id"]}
+    # 只把"会动文件或会重算 diff"的任务视为占用: model_sync(整仓同步)/file_batch/depo_delete。
+    # 其它任务(如 gitcode_import)不阻塞文件级入队 —— 租约本就按模型串行, 入队后自然排队,
+    # 但不应因为一个无关任务未跑完就迟迟不记录这次文件变动(2026-09-14 复查收紧)。
+    pending = {r["model"] for r in conn.execute(
+        "SELECT DISTINCT model FROM tasks WHERE org=? AND "
+        "status IN ('pending','claimed','running') "
+        "AND kind IN ('model_sync','file_batch','repo_delete')", (org.id,))}
+    for name in sorted(names):
+        rs, rm = sc.get(name), mo.get(name)
+        if rs is None or rs["gated"]:
+            stat["skip_gated"] += 1
+            continue                    # gated 完全不参与文件级
+        stat["managed"] += 1
+        dirty = []
+        if name not in baseline:
+            # 尚无魔塔文件基线(从未采纳/上次拉取失败) → 必须处理: 入队后由 worker 采纳建基线。
+            # 注意不能跳过 —— 否则"库里有部分基线"时这些仓永远不被采纳(2026-09-14)。
+            dirty.append("无基线")
+            stat["dirty_nobaseline"] += 1
+        else:
+            cur_s = lm_s.get(name, rs["last_modified"])
+            if rs["files_verified_lm"] is None or cur_s != rs["files_verified_lm"]:
+                dirty.append("scope")
+            cur_m = lm_m.get(name, rm["last_modified"] if rm is not None else None)
+            if (rm is None or rm["files_verified_lm"] is None or cur_m is None
+                    or cur_m != rm["files_verified_lm"]):
+                dirty.append("modelers")
+        if not dirty:
+            stat["clean"] += 1
+            continue
+        stat["dirty"] += 1
+        stat["dirty_names"].append(f"{name}({'+'.join(dirty)})")
+        if name in pending:
+            stat["skip_pending"] += 1
+            continue
+        if _enqueue(conn, org.id, tasks.KIND_FILE_BATCH, name, "to_modelers"):
+            stat["enq"] += 1
+    _commit(conn)
+    msg = (f"队列生成: 在管={stat['managed']} 变动={stat['dirty']}(其中无基线="
+           f"{stat['dirty_nobaseline']}) 入队={stat['enq']} 已一致={stat['clean']} "
+           f"跳过(已有任务)={stat['skip_pending']} gated={stat['skip_gated']}")
+    print(f"[reconcile] {org.id} {msg}", flush=True)
+    if stat["dirty_names"]:
+        print(f"[reconcile] {org.id} 变动明细: {', '.join(stat['dirty_names'][:20])}"
+              + ("..." if len(stat["dirty_names"]) > 20 else ""), flush=True)
+    db.set_runtime_state(conn, org.id, "sync.reconcile_progress", msg)
     return stat
 
 
@@ -951,14 +1087,55 @@ def scheduler_tick(conn, orgs, now: int | None = None, force: bool = False) -> l
             seen = {}
             r_model = model_level(conn, org, now)
             seen.update(r_model.get("seen", {}))
-            r_file = file_level(conn, org, now, seen=seen)
-            r_rehash = forced_rehash(conn, org, now)
+            # 先判定本轮是否要做"全量": 首次部署(库中无任何魔塔文件基线)或 audit --force。
+            # 必须在队列生成之前判定 —— 否则首次部署时全量还没建基线, 队列生成会把
+            # 全部仓按"无基线"各入队一个 file_batch(176 个), 全量跑完后又多出 176 个
+            # 已无必要的任务(2026-09-14 复查修复)。
+            n_scope_rows = conn.execute(
+                "SELECT COUNT(*) n FROM files WHERE org=? AND platform='scope'",
+                (org.id,)).fetchone()["n"] or 0
+            needs_full = bool(force) or n_scope_rows == 0
+            if needs_full:
+                r_queue = {"managed": 0, "dirty": 0, "enq": 0, "clean": 0,
+                           "skip_pending": 0, "skip_gated": 0, "dirty_nobaseline": 0,
+                           "dirty_names": [], "skipped_full_sweep": True}
+                print(f"[reconcile] {org.id} 本轮走文件级全量"
+                      f"({'audit --force' if force else '首次部署/无基线'}), 跳过队列生成(全量已覆盖)",
+                      flush=True)
+            else:
+                # ① 队列生成(零文件树请求): 只按两侧 model_list 的仓级 last_modified 判变动并入队
+                r_queue = file_enqueue_from_lists(conn, org, now, seen=seen)
+            # ② 文件级全量对账: 仅首次部署 或 audit --force
+            if force and n_scope_rows:
+                print(f"[reconcile] {org.id} audit --force: 强制执行文件级全量对账"
+                      f"(在管模型 {len(seen.get('scope', set()))} 个)", flush=True)
+            r_file = file_level(conn, org, now, seen=seen, full=needs_full)
+            # ③ 强哈希: 必须等"文件基线建全"后再跑(否则行不全 → 提前判完成, 且漏核验)
+            db_names = {r["name"] for r in conn.execute(
+                "SELECT name FROM models WHERE org=? AND platform='scope' AND gated=0",
+                (org.id,))}
+            baseline = {r["repo_id"].split("/", 1)[1] for r in conn.execute(
+                "SELECT DISTINCT repo_id FROM files WHERE org=? AND platform='scope'",
+                (org.id,)) if "/" in r["repo_id"]}
+            missing = sorted((set(seen.get("scope", set())) & db_names) - baseline)
+            # 仅在"本轮就是全量轮"且基线仍不全时跳过(给全量一轮机会); 否则照常跑 ——
+            # 若对任何缺失都永久跳过, 某个仓长期拉取失败会让强哈希永远不启动(2026-09-14 复查)。
+            if needs_full and missing:
+                r_rehash = {"checked": 0, "mismatch": 0, "ok": 0, "skipped_big": 0,
+                            "done": False, "failed": 0, "retry_only": False,
+                            "skipped_reason": f"文件基线未建全({len(missing)} 个模型待建), "
+                                              f"强哈希本轮跳过"}
+                print(f"[reconcile] {org.id} {r_rehash['skipped_reason']}: "
+                      f"{', '.join(missing[:5])}" + ("..." if len(missing) > 5 else ""), flush=True)
+            else:
+                r_rehash = forced_rehash(conn, org, now)
             # 时间戳 upsert(2026-09-14 修复 ①): 旧实现用 seed_app_config(INSERT OR IGNORE)
             # 只有首次写入生效 → 15min 节流在首次对账后永久失效(每个空转轮都跑整轮对账)
             db.set_app_config(conn, org.id, "sync.last_reconcile", now)
             idle_msg = f"空闲(上轮对账完成, 耗时 {_now() - t_tick}s)"
             db.set_runtime_state(conn, org.id, "sync.reconcile_progress", idle_msg)
-            results.append({"org": org.id, "model": r_model, "file": r_file, "rehash": r_rehash})
+            results.append({"org": org.id, "model": r_model, "queue": r_queue,
+                            "file": r_file, "rehash": r_rehash})
         except Exception as e:
             db.set_runtime_state(conn, org.id, "sync.reconcile_progress",
                                  f"对账异常: {type(e).__name__}: {e}")

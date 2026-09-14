@@ -308,16 +308,22 @@ def cmd_daemon(args) -> int:
                     print(f"[daemon] 对账异常 org={r.get('org')}: {r['error']}")
                 else:
                     m = r.get("model", {}) or {}
+                    q = r.get("queue", {}) or {}
                     f = r.get("file", {}) or {}
                     rh = r.get("rehash", {}) or {}
                     print(f"[daemon] 对账完成 org={r.get('org')} 耗时 {time.time() - t_rc:.0f}s | "
                           f"模型级: 新增→魔乐={m.get('to_modelers')} 反向={m.get('to_scope')} "
                           f"删除={m.get('repo_delete')} 采纳={m.get('adopted')} | "
-                          f"文件级: 检查={f.get('checked')} 上传={f.get('to_correct')} "
-                          f"待删={f.get('to_delete')} 独有={f.get('extra')} "
-                          f"入队={f.get('file_batch_enq')} | "
+                          f"队列生成(仅 model_list): 在管={q.get('managed')} 变动={q.get('dirty')} "
+                          f"入队={q.get('enq')} 已一致={q.get('clean')} "
+                          f"跳过(已有任务)={q.get('skip_pending')} | "
+                          f"文件级[{f.get('mode', '-')}]: 检查={f.get('checked')} "
+                          f"上传={f.get('to_correct')} 待删={f.get('to_delete')} "
+                          f"独有={f.get('extra')} 入队={f.get('file_batch_enq')} "
+                          f"已核验回写={f.get('verified')} | "
                           f"强哈希: 核对={rh.get('checked')} 不一致={rh.get('mismatch')} "
-                          f"失败={rh.get('failed')} 完成={rh.get('done')}")
+                          f"失败={rh.get('failed')} 完成={rh.get('done')}"
+                          + (f" 跳过={rh.get('skipped_reason')}" if rh.get("skipped_reason") else ""))
         except Exception as e:
             print(f"[daemon] scheduler_tick 异常: {type(e).__name__}: {e}")
         db.touch_heartbeat(conn, pid)
