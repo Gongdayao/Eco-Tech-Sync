@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+sync.db*
+tests/
+
+log/*
+!log/.gitkeep
+tmp/
+temp/
+*.log
+
+__pycache__/
+*.pyc

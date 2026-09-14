@@ -1,0 +1,51 @@
+# ============================================================
+# Eco-Tech-Sync-V2 — 依赖清单(2026-09 锁定)
+# ============================================================
+# 安装:
+#   conda create -n modelupdown python=3.11 -y
+#   conda activate modelupdown
+#   pip install -r requirements.txt
+#
+# 环境基线(实测开发环境): Python 3.11.15
+# 传递依赖由 pip 自动解析安装, 无需手工列举。
+
+# ------------------------------------------------------------
+# 1) 核心依赖(版本锁定, 与开发/部署环境一致)
+# ------------------------------------------------------------
+# 魔塔 API 主力客户端(新 SDK, OpenAPI-first + legacy 回退;
+#   文件树/哈希/上传/建仓/删除均由它承担)。
+modelscope-hub==0.2.0
+
+# 魔乐 API 客户端(LFS/文件树/上传/批量删除 create_commit)。
+openmind-hub==1.3.0
+
+# 魔塔旧库 —— 【仅环境锁定, 代码不使用】:
+#   modelscope-hub 0.2.0 的 Requires 不含 modelscope, 但部署环境按此版本
+#   一并安装以保证与开发环境完全一致(便于日后如需旧 SDK 工具时切换)。
+modelscope==1.39.1
+
+# ------------------------------------------------------------
+# 2) 直接依赖(代码中 import 的第三方库; 版本为开发环境实测值)
+# ------------------------------------------------------------
+# env_tools/config.py / env_tools/pipeline.py: YAML 配置与 README front matter 解析
+PyYAML==6.0.3
+
+# env_tools/env_bootstrap.py / config.py: .env 密钥加载
+python-dotenv==1.2.3
+
+# env_tools/transfer.py / gitcode.py / alerts.py: HTTP 调用
+#   (魔乐裸 DELETE 回退 / LFS batch / GitCode API / webhook)
+requests==2.32.2
+
+# ------------------------------------------------------------
+# 3) 说明
+# ------------------------------------------------------------
+# - 传递依赖(自动安装, 无需手写):
+#     openmind-hub 1.3.0 Requires: filelock / fsspec / jinja2 / pyyaml / requests / tqdm / urllib3
+#     modelscope-hub 0.2.0 Requires: filelock / requests / tqdm / urllib3
+#     modelscope   1.39.1 Requires: filelock / modelscope-hub / packaging / requests /
+#                                   setuptools / tqdm / urllib3
+#   如需完整复刻环境, 可执行 pip freeze 全量导出。
+# - 生产部署(另一台 Linux): 安装命令见 README §9.2。
+# - 升级策略: 三个核心版本为运行基线, 升级前先在开发环境验证
+#   (SDK 行为差异会影响 fetch/上传/删除路径)。
