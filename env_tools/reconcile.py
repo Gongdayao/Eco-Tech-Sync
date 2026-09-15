@@ -589,6 +589,10 @@ def file_level(conn, org, now: int | None = None, seen: dict | None = None,
     入队规则与历史一致: 只 在 worker 真正有动作时入队(_actionable_split)。
 
     逐模型明细会落日志(初始部署是敏感期, 用户要求"文件和模型级增删改都有清楚 log")。
+
+    ⚠ 逐模型拉文件树**有意串行, 勿改并发**(2026-09-15 用户定稿): 这是元数据请求
+    (每模型 2 次 list), 密集并发对魔塔有 WAF 403 风险(见 utils/ratelimit.py 教训);
+    带宽瓶颈在任务执行侧, 那里已用平台 SDK 并发池。
     """
     now = now or _now()
     if not full:
@@ -993,6 +997,10 @@ def forced_rehash(conn, org, now: int | None = None) -> dict:
         "ORDER BY COALESCE(rehash_fail_count, 0) ASC, path ASC "
         "LIMIT ?",
         (org.id, big_limit) + where_params + (batch,)).fetchall()
+    # 逐文件串行下载+哈希 —— **有意为之, 勿改并发**(2026-09-15 用户定稿):
+    #   强哈希是"元数据/内容核验"轮, 不属于同步任务; 逐文件串行 + 每轮 batch 上限本身就是
+    #   限速设计(魔乐平台密集请求有 WAF 风险, 见 utils/ratelimit.py 教训);
+    #   任务执行侧(transfer._download_set)已按"任务内借用 SDK 并发池"并行, 那里才是带宽瓶颈。
     for r in rows:
         try:
             from openmind_hub import om_hub_download

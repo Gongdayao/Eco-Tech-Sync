@@ -39,6 +39,9 @@ sync:
   full_audit_interval_h: 24
   forced_rehash_interval_d: 30     # 强哈希复核周期(天); 首次部署全量核验不受此限(见下)
   forced_rehash_batch: 800           # 强哈希每轮处理上限(首次全量分多轮跑, 避免阻塞对账)
+  download_workers: 5               # 【任务内并发】下载并发度: 传给平台 SDK 并发池
+                                    # (魔塔 download_repo / 魔乐 snapshot_download 的 max_workers,
+                                    #  对齐 v1 的 5; 任务与任务之间仍严格串行, 只并发任务内部)
   delete_grace_cycles: 3            # 【仅模型级】魔塔 repo 删除传播宽限轮数(文件级删除 2026-09 起无宽限, 对齐 v1)
   pipeline_max_models: 1
 

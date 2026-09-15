@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 
 from utils.ratelimit import global_limiter
@@ -312,36 +313,105 @@ def _progress(conn, task_id, text: str) -> None:
 
 def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
                   dest_dir: str, on_file=None) -> int:
-    """逐文件下载; on_file(i, n, path) 供调用方写进度日志/落库(2026-09)。"""
+    """整批下载: **任务内部并发**(借用平台 SDK 的并发快照池), 缺失时回退逐文件。
+
+    2026-09-15 修复(用户定稿原则: 任务与任务之间串行, 任务内部借用平台 SDK 并行):
+      旧实现 `for path in paths: _download_one(...)` 是逐文件串行 —— 实测 8.73GB 用
+      8 分多钟(≈20MB/s), 打不满带宽; v1 走的是 `snapshot_download(max_workers=5)`。
+      现按源侧选择 SDK 并发接口:
+        魔塔: `HubApi.download_repo(repo_id, repo_type='model', local_dir, allow_patterns, max_workers)`
+        魔乐: `openmind_hub.snapshot_download(repo_id, repo_type='model', local_dir,
+               allow_patterns, force_download=True, local_dir_use_symlinks=False, max_workers)`
+      并发度 = app_config `sync.download_workers`(默认 5, 对齐 v1)。
+      `allow_patterns` 传精确路径(含 TP1/… 嵌套路径实测可行), 不下载本次无关文件。
+      并发后逐文件进度由 SDK 自己的 tqdm 输出; on_file 仍按原契约回调
+      (开始一次 / 回退时逐文件 / 批次完成一次), 供 DB 进度与日志使用。
+      任一文件缺失 → 回退逐个补齐; 仍失败 → 抛错(任务失败, 不进入上传)。
+    """
+    paths = [p for p in paths if p]
+    if not paths:
+        return 0
+    from env_tools import db as _db
     repo_id = _repo_id(org, src_platform, model)
-    n = 0
-    for i, path in enumerate(paths, 1):
+    n = len(paths)
+    sizes = {}
+    for p in paths:
+        row = conn.execute(
+            "SELECT size FROM files WHERE org=? AND platform=? AND repo_id=? AND path=?",
+            (org.id, src_platform, repo_id, p)).fetchone()
+        sizes[p] = (row["size"] if row else 0) or 0
+    total = sum(sizes.values())
+    workers = int(_db.get_app_config(conn, org.id, "sync.download_workers", 5))
+    os.makedirs(dest_dir, exist_ok=True)
+    api_name = "download_repo" if src_platform == "scope" else "snapshot_download"
+    print(f"[transfer] {src_platform}/{model} 并发下载 {n} 个文件 ({total / 1e9:.2f} GB): "
+          f"{api_name}(allow_patterns={n}, max_workers={workers}, 任务内并发)", flush=True)
+    if on_file is not None:
         try:
-            _download_one(org, src_platform, repo_id, path, dest_dir)
-            n += 1
-        except Exception as e:
-            print(f"[transfer] 下载失败 {src_platform}/{model}/{path}: {type(e).__name__}: {e}")
-            raise
+            on_file(0, n, f"并发下载开始({api_name}, max_workers={workers})")
+        except Exception:
+            pass
+    missing: list[str] = list(paths)
+    try:
+        global_limiter.wait()
+        if src_platform == "scope":
+            _scope_api(org).download_repo(repo_id, repo_type="model", revision="master",
+                                          local_dir=dest_dir, allow_patterns=list(paths),
+                                          max_workers=workers)
+        else:
+            from openmind_hub import snapshot_download
+            snapshot_download(repo_id, repo_type="model", revision="main",
+                              local_dir=dest_dir, allow_patterns=list(paths),
+                              force_download=True, local_dir_use_symlinks=False,
+                              token=org.modelers.token, max_workers=workers)
+        missing = [p for p in paths if not os.path.isfile(os.path.join(dest_dir, p))]
+    except Exception as e:
+        print(f"[transfer] {src_platform}/{model} 并发下载异常 → 回退逐文件: "
+              f"{type(e).__name__}: {e}", flush=True)
+        missing = list(paths)
+    done = n - len(missing)
+    for p in list(missing):                      # 回退补齐(保留"失败即抛"语义)
+        _download_one(org, src_platform, repo_id, p, dest_dir)
+        done += 1
         if on_file is not None:
             try:
-                on_file(i, len(paths), path)
+                on_file(done, n, p)
             except Exception:
                 pass
-    return n
+    print(f"[transfer] {src_platform}/{model} 并发下载完成: {done}/{n} 个文件 "
+          f"({total / 1e9:.2f} GB)"
+          + (f", 其中回退逐文件 {len(missing)} 个" if missing else ""), flush=True)
+    if on_file is not None and not missing:
+        try:
+            on_file(n, n, paths[-1])             # 批次完成 → 调用方刷新进度/日志
+        except Exception:
+            pass
+    return done
 
 
 def _upload_dir(org, dst_platform: str, model: str, folder: str,
                 commit_msg: str) -> None:
-    """整批上传(一次 commit); max_workers=5。"""
+    """整批上传(一次 commit); 并发由 SDK 内部池负责, 不做 work 级并发。
+
+    接口(打印出来便于审计, 2026-09-15):
+      魔塔: `HubApi.upload_folder(..., max_workers=5, 一次 commit)`
+      魔乐: `openmind_hub.upload_folder(...)`(SDK 内部 pipeline 批量, 日志可见
+            `Adaptive batch size` / `pipeline mode`)
+    """
     repo_id = _repo_id(org, dst_platform, model)
+    n_files = sum(len(fs) for _r, _d, fs in os.walk(folder))
     if dst_platform == "scope":
         api = _scope_api(org)
+        print(f"[transfer] 魔塔 upload_folder(repo_id={repo_id}, files={n_files}, "
+              f"max_workers=5, 一次 commit): {commit_msg}", flush=True)
         global_limiter.wait()
         api.upload_folder(repo_id, "model", folder_path=folder, max_workers=5,
                           disable_tqdm=True, commit_message=commit_msg,
                           ignore_patterns=[".git", "*.tmp", ".*~"])
     else:
         from openmind_hub import upload_folder
+        print(f"[transfer] 魔乐 upload_folder(repo_id={repo_id}, files={n_files}, "
+              f"一次 commit(并发由 SDK pipeline 负责)): {commit_msg}", flush=True)
         global_limiter.wait()
         upload_folder(repo_id, folder_path=folder, token=org.modelers.token,
                       commit_message=commit_msg)
@@ -821,11 +891,15 @@ def _delete_files(conn, org, platform: str, model: str, paths: list[str]) -> dic
         return {"ok": True, "deleted": []}
     if platform == "scope":
         api = _scope_api(org)
+        print(f"[transfer] 魔塔 delete_files(repo_id={repo_id}, files={len(paths)}, 一次 commit)",
+              flush=True)
         global_limiter.wait()
         api.delete_files(repo_id, "model", list(paths),
                          commit_message=f"sync v2 删除 {len(paths)} 文件")
     else:
         from openmind_hub import create_commit, CommitOperationDelete
+        print(f"[transfer] 魔乐 create_commit(删除 {len(paths)} 个文件, 一次 commit)",
+              flush=True)
         try:
             global_limiter.wait()
             create_commit(repo_id,
@@ -835,6 +909,8 @@ def _delete_files(conn, org, platform: str, model: str, paths: list[str]) -> dic
         except Exception:
             # 回退: 逐个单文件删除
             from openmind_hub.plugins.openmind import om_api as _oma
+            print(f"[transfer] 魔乐 create_commit 删除失败 → 回退 OmApi.delete_file × {len(paths)}"
+                  f"(逐个 commit)", flush=True)
             for p in paths:
                 global_limiter.wait()
                 _oma.OmApi().delete_file(path_in_repo=p, repo_id=repo_id,
