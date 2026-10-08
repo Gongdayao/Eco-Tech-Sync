@@ -28,7 +28,7 @@ from env_tools import db, tasks  # noqa: E402
 from env_tools.config import load_config, get_org  # noqa: E402
 
 
-def _precheck_source(conn, org, task) -> tuple[bool, str | None]:
+def _precheck_source(org, task) -> tuple[bool, str | None]:
     """执行前预检(强制第一步, 见 V2-DESIGN.md §4 规则 / 指南 §8.4):
     源 repo 存在性 check; repo_delete/gitcode_import 无需源检查。
 
@@ -45,7 +45,7 @@ def _precheck_source(conn, org, task) -> tuple[bool, str | None]:
     return True, None
 
 
-def _execute(conn, org, task, stub_fail: bool) -> None:
+def _execute(conn, org, task) -> None:
     """按 kind 分发执行(状态回写由调用方 run() 统一处理)。"""
     if not org.scope.configured or not org.modelers.configured:
         raise RuntimeError(f"org '{org.id}' 缺少 scope/modelers 平台配置")
@@ -58,7 +58,7 @@ def _execute(conn, org, task, stub_fail: bool) -> None:
             else:
                 result = transfer.sync_files(conn, org, task)
         except Exception as err:
-            transfer._maybe_clean_stage(conn, task, org.updown_dir(task["model"]), err)
+            transfer._maybe_clean_stage(task, org.updown_dir(task["model"]), err)
             raise
     elif task["kind"] == tasks.KIND_REPO_DELETE:
         result = transfer.delete_repo_task(conn, org, task)
@@ -115,7 +115,7 @@ def run(task_id: int, stub_fail: bool = False) -> int:
 
     # 1) 源存在性预检 → 源消失则作废(不占失败次数, 不告警)
     try:
-        ok, obsolete_reason = _precheck_source(conn, org, task)
+        ok, obsolete_reason = _precheck_source(org, task)
         if not ok:
             tasks.obsolete_task(conn, task_id, obsolete_reason or "源不存在")
             print(f"[task_runner] 作废: task={task_id} {obsolete_reason}")
@@ -129,7 +129,7 @@ def run(task_id: int, stub_fail: bool = False) -> int:
 
     # 2) 执行
     try:
-        _execute(conn, org, task, stub_fail)
+        _execute(conn, org, task)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         tasks.fail_task(conn, task_id, err)

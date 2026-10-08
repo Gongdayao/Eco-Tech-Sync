@@ -40,8 +40,8 @@ def _is_sha256(v) -> bool:
     return len(v) == 64 and all(c in "0123456789abcdef" for c in v)
 
 
-def _enqueue(conn, org_id: str, kind: str, model: str, direction: str | None = None,
-             priority: int = tasks.PRIORITY_NORMAL) -> bool:
+def _enqueue(conn, org_id: str, kind: str, model: str,
+             direction: str | None = None) -> bool:
     _, created = tasks.enqueue_task(conn, org_id, kind, model,
                                     direction=direction, created_by="reconcile")
     return created
@@ -516,8 +516,8 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
         m_is_init = bool(row_m["is_init"]) if row_m is not None else False
         if not s_is_init and not m_is_init:
             from env_tools import pipeline as _pl
-            s_text = _download_readme_text(conn, org, "scope", model)
-            m_text = _download_readme_text(conn, org, "modelers", model)
+            s_text = _download_readme_text(org, "scope", model)
+            m_text = _download_readme_text(org, "modelers", model)
             if s_text is not None and m_text is not None:
                 s_body = _pl.normalize_body(_pl.split_front_matter(s_text)[1])
                 m_body = _pl.normalize_body(_pl.split_front_matter(m_text)[1])
@@ -544,7 +544,7 @@ def _poison_excluded(path: str, size: int = 0) -> bool:
     return _p.is_excluded(_p.classify(path, size))
 
 
-def _actionable_split(conn, org, model: str, d: dict, now: int) -> dict:
+def _actionable_split(conn, org, model: str, d: dict) -> dict:
     """按 worker(transfer.sync_files)的删除保护规则, 拆出"执行时真有动作"的部分。
 
     返回 {"run": set(worker 本轮会真正执行的 path), "manual": set(仅人工可处理的 extra)}。
@@ -650,8 +650,8 @@ def file_level(conn, org, now: int | None = None, seen: dict | None = None,
                 _record_verified(conn, org, model, seen)   # 无待办才回写; 有任务则由 worker 回写
                 stat["verified"] += 1
             continue
-        _readme_isinit_confirm(conn, org, model, d, stat, now)
-        act = _actionable_split(conn, org, model, d, now)
+        _readme_isinit_confirm(conn, org, model, d, now)
+        act = _actionable_split(conn, org, model, d)
         stat["to_correct"] += len(d["to_modelers"])
         stat["extra"] += len(d["extra"])
         if d.get("readme_body_mismatch"):
@@ -796,7 +796,7 @@ def file_enqueue_from_lists(conn, org, now: int | None = None, seen: dict | None
 
 
 # ================================================================ README is_init(采纳/确认)
-def _download_readme_text(conn, org, platform: str, model: str) -> str | None:
+def _download_readme_text(org, platform: str, model: str) -> str | None:
     import os
     import shutil
     import tempfile
@@ -828,7 +828,7 @@ def _adopt_readme_check(conn, org, model: str, d: dict, stat: dict) -> None:
     texts = {}
     for plat in ("scope", "modelers"):
         if d["readme"].get(plat):
-            texts[plat] = _download_readme_text(conn, org, plat, model) or ""
+            texts[plat] = _download_readme_text(org, plat, model) or ""
     if not texts:
         return
     init = {plat: pipeline.detect_init_content(t) for plat, t in texts.items()}
@@ -857,7 +857,7 @@ def _adopt_readme_check(conn, org, model: str, d: dict, stat: dict) -> None:
     _commit(conn)
 
 
-def _readme_isinit_confirm(conn, org, model: str, d: dict, stat: dict, now: int) -> None:
+def _readme_isinit_confirm(conn, org, model: str, d: dict, now: int) -> None:
     """常规轮: README 在待纠正集时, 以魔塔 README 实际内容做 init 判定:
       - init(空/平台模板)→ 移出 to_modelers(不同步, 防循环), 标 scope is_init=1,
         并把本次 API 指纹刷入基线(平台重写 init 只刷基线不触发任务);
@@ -871,7 +871,7 @@ def _readme_isinit_confirm(conn, org, model: str, d: dict, stat: dict, now: int)
     if "README.md" not in d["to_modelers"]:
         return
     repo_id = f"{org.scope.repo_name}/{model}"
-    text = _download_readme_text(conn, org, "scope", model)
+    text = _download_readme_text(org, "scope", model)
     if text is None:
         return
     if pipeline.detect_init_content(text):

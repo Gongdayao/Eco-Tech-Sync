@@ -254,7 +254,7 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _on_signal)
 
 
-def _on_signal(signum, frame) -> None:
+def _on_signal(signum, _frame) -> None:
     global _running
     _running = False
     print(f"[daemon] 收到信号 {signum}, 正在优雅退出...")

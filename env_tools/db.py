@@ -216,13 +216,6 @@ def get_conn(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
-def close_conn() -> None:
-    conn = getattr(_thread_local, "conn", None)
-    if conn is not None:
-        conn.close()
-        _thread_local.conn = None
-
-
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()

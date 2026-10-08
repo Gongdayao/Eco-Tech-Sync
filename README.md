@@ -85,14 +85,17 @@ ALERT_WEBHOOK_URL=""                             # 告警 webhook(可选)
 ### 4.2 `config.yaml`
 
 - `orgs[]`:每个组织一组 scope/modelers/gitcode 配置 + `weights_subdir`;
-- 节奏/传输/重试/告警配置启动时种子化进 DB(`app_config`,运行期可改):
+- 节奏/告警配置启动时种子化进 DB(`app_config`,运行期可改;2026-10-08 清理了 8 个
+  "代码从不读取"的假旋钮: `global.logger_name`、`sync.file_interval_min`/`sync.full_audit_interval_h`/
+  `sync.pipeline_max_models`、整个 `transfer.*` 段、`retry.max_attempts`/`retry.urgent_retry_s`、
+  `alert.failed_threshold`/`alert.daily_summary`;任务失败次数固定 3 档, 见 §7):
   `sync.auto_delete_extra=true`(严格镜像:魔乐独有文件一律自动删;false=只告警人工确认)、
   `sync.forced_rehash_interval_d` / `sync.forced_rehash_batch`(强哈希复核周期与每轮上限)、
   `sync.delete_grace_cycles`(**仅模型级** repo 删除宽限轮数)、`sync.model_interval_min` 等;
-  2026-10-08 新增:`sync.download_workers`(任务内下载并发)、`sync.upload_max_files`
-  (单次 commit 文件数上限, 0=不分块; 生产建议 20)、`sync.stage_stale_days`(暂存清理天数, 默认 7)、
+  2026-10-08 新增:`sync.download_workers`(任务内下载并发)、`sync.stage_stale_days`(暂存清理天数, 默认 7)、
   `sync.cache_stale_days`(SDK 缓存清理天数, 默认 30)、`sync.file_retry_backoff_min` /
   `sync.file_retry_backoff_cap_h`(同步任务终态失败后的指数退避, 默认 30min 起 / 24h 上限);
+  `alert.webhook_url`(告警 webhook, 见 §10)。
 - ⚠ 种子化是 `INSERT OR IGNORE`:改 config.yaml 不影响**已存在**的 DB,需改 `app_config` 或删库重建。
 
 ## 5. 操作方法(全量)
@@ -381,7 +384,7 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | README | 2026-09 规则:魔塔**无 README** = 空白 → 不同步、不删魔乐 README、不告警;**不参与跨端同名内容比对与强哈希核对**(front matter/license 归一化导致裸哈希必然不同);**正文一致性单独校验**:每轮剥离 front matter 比正文, 不一致 → 自动以魔塔版覆盖魔乐 + `readme_body_mismatch` 留痕告警(每模型下载两侧 README 小文件比对; 已在待同步集则跳过);比较口径(2026-09-14):front matter 块**前后空行容忍**(兼容首行空行/BOM/CRLF)、正文取"第一行非空行 ~ 最后一行非空行"(**首尾空行容忍**), **正文内部空行与排版差异不容忍**(不逐行 rstrip、不折叠内部空行)——避免"首行空行致剥头失败→每轮空转"与"元数据被当正文写进目标卡片"两类问题;魔塔 init(空/模板)不同步;real → 变换同步魔乐(双向模型级上传前判 init, init 不传);魔乐 README 永不因独有删除;license 由建仓参数从魔塔元数据兜底传递 |
 | GitCode | 纯镜像:魔塔公开新增→导入(**返回驱动确认**, 对齐 v1);导入成功提示开启 pull(**仅同步器工作周期内导入的模型**, 非每日);魔塔删除确认→删除对齐;`scan_and_fill` 全量补齐 |
 
-### 6.1 下载复用 / 上传分块 / 失败退避(2026-10-08)
+### 6.1 下载复用 / 失败退避(2026-10-08)
 
 生产问题驱动(一个 1.2TB 级任务在"上传 commit 500"后连续重试好几天, 反复重下+重传, 镜像长期
 残缺), 2026-10-08 定稿三条规则:

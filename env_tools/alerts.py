@@ -15,7 +15,6 @@ webhook URL 读 app_config 'alert.webhook_url'(config.yaml ${ALERT_WEBHOOK_URL} 
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
 

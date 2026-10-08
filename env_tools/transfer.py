@@ -558,61 +558,34 @@ def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
     return n
 
 
-def _upload_dir(org, dst_platform: str, model: str, folder: str,
-                commit_msg: str, conn=None) -> None:
-    """整批上传; 按 `sync.upload_max_files` 分块(每块一次 commit), 并发由 SDK 内部池负责。
+def _upload_dir(org, dst_platform: str, model: str, folder: str, commit_msg: str) -> None:
+    """整批上传(**一次 commit**, 2026-10-08 用户定稿); 并发由 SDK 内部池负责, 不做 work 级并发。
 
-    2026-10-08(生产事故驱动): 出现过"78 个 LFS 文件全部传完后 commit 端点 500"→ 整批不落地、
-    下次重试重传一小时。分块后单块失败只丢该块, 其余块已落地(下一轮对账只补剩余)。
-    `upload_max_files=0`(默认)= 不分块(旧行为); 大权重建议设 20 左右。
-    接口: 魔塔 `HubApi.upload_folder(..., max_workers=5)`; 魔乐 `openmind_hub.upload_folder(...)`。
+    接口(打印出来便于审计):
+      魔塔: `HubApi.upload_folder(..., max_workers=5, 一次 commit)`
+      魔乐: `openmind_hub.upload_folder(...)`(SDK 内部 pipeline 批量, 日志可见 `Adaptive batch size`)
+    说明: 曾试过按 `sync.upload_max_files` 分块提交以降低"commit 端点 500"的损失, 但用户
+    明确要"一次 commit 提交整批"(保持与魔塔/魔乐双方状态的一致性语义), 故不做分块。
     """
-    from env_tools import db as _db
     repo_id = _repo_id(org, dst_platform, model)
-    flist = sorted(
-        os.path.relpath(os.path.join(r, f), folder)
-        for r, _d, fs in os.walk(folder) for f in fs
-        if f != _UPLOAD_CACHE_FILE)
-    if not flist:
-        return
-    cap = int(_db.get_app_config(conn, org.id, "sync.upload_max_files", 0)) if conn is not None else 0
-    chunks = [flist] if cap <= 0 else [flist[i:i + cap] for i in range(0, len(flist), cap)]
-    for idx, chunk in enumerate(chunks, 1):
-        part = folder
-        if len(chunks) > 1:
-            # 分块: 硬链接组一个只含本块文件的临时目录(保持相对路径), 上传后删掉
-            part = os.path.join(os.path.dirname(folder), f".part_{os.path.basename(folder)}_{idx}")
-            shutil.rmtree(part, ignore_errors=True)
-            for rel in chunk:
-                s_path, d_path = os.path.join(folder, rel), os.path.join(part, rel)
-                os.makedirs(os.path.dirname(d_path), exist_ok=True)
-                try:
-                    os.link(s_path, d_path)
-                except OSError:
-                    shutil.copyfile(s_path, d_path)
-        tag = f"[{idx}/{len(chunks)}]" if len(chunks) > 1 else ""
-        try:
-            if dst_platform == "scope":
-                api = _scope_api(org)
-                print(f"[transfer] 魔塔 upload_folder(repo_id={repo_id}, files={len(chunk)}{tag}, "
-                      f"max_workers=5, 一次 commit): {commit_msg}", flush=True)
-                global_limiter.wait()
-                api.upload_folder(repo_id, "model", folder_path=part, max_workers=5,
-                                  disable_tqdm=True, commit_message=f"{commit_msg} {tag}".strip(),
-                                  ignore_patterns=[".git", "*.tmp", ".*~", _UPLOAD_CACHE_FILE])
-            else:
-                from openmind_hub import upload_folder
-                print(f"[transfer] 魔乐 upload_folder(repo_id={repo_id}, files={len(chunk)}{tag}, "
-                      f"一次 commit(并发由 SDK pipeline 负责)): {commit_msg}", flush=True)
-                global_limiter.wait()
-                upload_folder(repo_id, folder_path=part, token=org.modelers.token,
-                              commit_message=f"{commit_msg} {tag}".strip())
-        finally:
-            if part != folder:
-                shutil.rmtree(part, ignore_errors=True)
+    if dst_platform == "scope":
+        api = _scope_api(org)
+        print(f"[transfer] 魔塔 upload_folder(repo_id={repo_id}, max_workers=5, 一次 commit): "
+              f"{commit_msg}", flush=True)
+        global_limiter.wait()
+        api.upload_folder(repo_id, "model", folder_path=folder, max_workers=5,
+                          disable_tqdm=True, commit_message=commit_msg,
+                          ignore_patterns=[".git", "*.tmp", ".*~", _UPLOAD_CACHE_FILE])
+    else:
+        from openmind_hub import upload_folder
+        print(f"[transfer] 魔乐 upload_folder(repo_id={repo_id}, 一次 commit"
+              f"(并发由 SDK pipeline 负责)): {commit_msg}", flush=True)
+        global_limiter.wait()
+        upload_folder(repo_id, folder_path=folder, token=org.modelers.token,
+                      commit_message=commit_msg)
 
 
-def _maybe_clean_stage(conn, task, stage: str, err: BaseException | None) -> str:
+def _maybe_clean_stage(task, stage: str, err: BaseException | None) -> str:
     """暂存目录生命周期(2026-10-08 定稿): 成功→删; 失败且还会重试→保留; 终态失败→删。
 
     保留的意义: 下次尝试由 SDK 校验后跳过已下好的文件、半截文件续传(实测), 不再从零重下。
@@ -799,7 +772,7 @@ def record_files_verified(conn, org, model: str, scope_lm: int | None = None,
     return out
 
 
-def _stage_readme(conn, org, dst_platform: str, model: str, src_text: str,
+def _stage_readme(conn, org, dst_platform: str, src_text: str,
                   stage_dir: str) -> None:
     """README 走管线变换后落盘到上传暂存目录。"""
     from env_tools import pipeline
@@ -826,7 +799,7 @@ def _license_for_scope(conn, org, model: str) -> str | None:
     """
     from env_tools import pipeline
     from env_tools.reconcile import _download_readme_text
-    text = _download_readme_text(conn, org, "modelers", model)
+    text = _download_readme_text(org, "modelers", model)
     if not text or pipeline.detect_init_content(text):
         return None
     fm, _body = pipeline.split_front_matter(text)
@@ -910,7 +883,7 @@ def _readme_download_and_stage(conn, org, src: str, dst: str, model: str,
             _set_row_is_init(conn, org.id, src, _repo_id(org, src, model), 1)
             conn.commit()
             return False
-        _stage_readme(conn, org, dst, model, text, stage_dir)
+        _stage_readme(conn, org, dst, text, stage_dir)
         _set_row_is_init(conn, org.id, dst, _repo_id(org, dst, model), 0)
         conn.commit()
         return True
@@ -989,7 +962,7 @@ def sync_model(conn, org, task) -> dict:
         _progress(conn, task_id, f"上传 {len(paths)} 个文件 ({total_bytes / 1e9:.2f} GB, 一次 commit)")
         print(f"[sync] {model} model_sync 开始批量上传 {len(paths)} 个文件 "
               f"({total_bytes / 1e9:.2f} GB, 一次 commit) ...", flush=True)
-        _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}", conn=conn)
+        _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}")
 
     # 5) 校验 + 6) 回写基线(含 last_synced_at 标记目标侧)
     _refresh_baselines(conn, org, model, now)
@@ -999,7 +972,7 @@ def sync_model(conn, org, task) -> dict:
     if readme is not None:
         synced.append("README.md")
     _mark_synced(conn, org.id, dst, _repo_id(org, dst, model), synced, now)
-    _maybe_clean_stage(conn, task, stage, None)      # 成功 → 删暂存(2026-10-08 policy A)
+    _maybe_clean_stage(task, stage, None)            # 成功 → 删暂存(2026-10-08 policy A)
     _reset_file_fail(conn, org, model)               # 成功 → 清失败退避
     _log_list(f"{model} model_sync {src}→{dst} 上传(一次 commit)", synced,
               total_bytes=sum(sizes.get(p, 0) for p in synced))
@@ -1108,12 +1081,11 @@ def sync_files(conn, org, task) -> dict:
         _progress(conn, task_id, f"上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)")
         print(f"[sync] {model} 开始批量上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)",
               flush=True)
-        _upload_dir(org, "modelers", model, stage,
-                    f"sync v2 file_batch: {model} →modelers", conn=conn)
+        _upload_dir(org, "modelers", model, stage, f"sync v2 file_batch: {model} →modelers")
         uploaded = ups + (["README.md"] if "README.md" in d["to_modelers"] else [])
         _progress(conn, task_id, f"上传完成 {len(uploaded)} 个文件")
     # 2026-10-08: 成功 → 删暂存 + 复位失败退避; 失败 → 暂存保留待重试(task_runner 决定终态清理)
-    _maybe_clean_stage(conn, task, stage, None)
+    _maybe_clean_stage(task, stage, None)
     _reset_file_fail(conn, org, model)
     if uploaded:
         _log_list(f"{model} file_batch 上传(一次 commit)", uploaded,

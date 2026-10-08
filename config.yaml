@@ -3,7 +3,6 @@
 
 global:
   weights_path: ${WEIGHTS_PATH}    # 可选: 未设/省略 → 默认 <项目根>/weights(可移植, 见 config.py)
-  logger_name: applog
 
 orgs:
   - id: Eco-Tech
@@ -49,39 +48,16 @@ sync:
   auto_delete_extra: true     # 严格镜像(2026-09 用户定稿): true = 魔乐独有文件一律自动删
                               # (含 .safetensors/>50MB, 保证与魔塔文件集严格一致, 避免新旧共存窗口);
                               # false = 只告警 delete_manual 人工确认(可用 server-work.py clean 执行)
-  file_interval_min: 15            # 文件级周期(文件级删除已无宽限, 见 delete_grace_cycles 注释)
-  full_audit_interval_h: 24
   forced_rehash_interval_d: 30     # 强哈希复核周期(天); 首次部署全量核验不受此限(见下)
   forced_rehash_batch: 800           # 强哈希每轮处理上限(首次全量分多轮跑, 避免阻塞对账)
   download_workers: 5               # 【任务内并发】下载并发度: 传给平台 SDK 并发池
                                     # (魔塔 download_repo / 魔乐 snapshot_download 的 max_workers,
                                     #  对齐 v1 的 5; 任务与任务之间仍严格串行, 只并发任务内部)
   delete_grace_cycles: 3            # 【仅模型级】魔塔 repo 删除传播宽限轮数(文件级删除 2026-09 起无宽限, 对齐 v1)
-  upload_max_files: 0               # 【2026-10-08】单次 commit 的文件数上限(0 = 不分块, 旧行为)。
-                                    # 生产出现过"78 个 LFS 文件传完后 commit 端点 500 → 整批不落地,
-                                    # 下次重试重传一小时"; 设为 20 左右可让失败只丢一块, 其余已落地。
   stage_stale_days: 7               # 暂存目录(updown_weights/compare_weights)超过 N 天未改动 → 清
   cache_stale_days: 30              # SDK 缓存(<weights>/.cache) 超过 N 天未改动 → 清(复用基础, 阈值放宽)
   file_retry_backoff_min: 30        # 【2026-10-08】文件级/模型级同步"终态失败"后指数退避起点(分钟)
   file_retry_backoff_cap_h: 24      # 退避上限(小时); 退避期内不再重建任务(避免无限重试烧带宽)
-  pipeline_max_models: 1
-
-transfer:
-  max_workers: 5
-  verify_after_upload: true
-  # task_timeout_s 已废弃: 不设"任务最长执行时间" —— 权重越来越大
-  # (2.4T 千兆满速也要 5.6h+), 固定超时不可控; 失败重启次数由 retry.max_attempts
-  # 三档政策控制(第1次原位重启 / 第2次压队列尾 / 达到上限停止等人工)。
-  mode: overlap
-  upload_cap_mbps: 0
-
-retry:
-  max_attempts: 3            # 失败机会次数: 第1次→原位重启, 第2次→压队列尾, 达到上限→停止拉起等人工
-  # tail_backoff_s: 3600     # (可选) 第2次失败压队尾时附加的延迟秒数, 默认 0 = 仅排到队尾
-  urgent_retry_s: [30, 120, 600]   # 紧急任务专用节奏(Phase 3 用)
-  # base_backoff_s / max_backoff_s 已废弃: 不再用指数退避, 改为三档重启制
 
 alert:
   webhook_url: ${ALERT_WEBHOOK_URL}
-  failed_threshold: 3
-  daily_summary: true
