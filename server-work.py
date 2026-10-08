@@ -86,7 +86,7 @@ def _init(config_path: str | None):
     conn = db.get_conn()
     for org in orgs:
         defaults = {}
-        for section in ("sync", "transfer", "retry", "alert"):
+        for section in ("sync", "alert"):        # 2026-10-08: transfer/retry 段已删(全部键代码不读)
             defaults.update(_flatten(raw_cfg.get(section, {}) or {}, section))
         db.seed_app_config(conn, org.id, defaults)
     return raw_cfg, orgs, conn
