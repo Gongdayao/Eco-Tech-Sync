@@ -277,11 +277,41 @@ def crash_recovery(conn: sqlite3.Connection) -> int:
 
 def insert_alert(conn: sqlite3.Connection, org: str, task_id: int | None,
                  model: str, level: str, error: str) -> None:
+    """告警**唯一入口**: 落库 + webhook 推送(2026-10-08 接线)。
+
+    接线前 `dispatch_webhook` 只被 `notify_urgent_failure` 调用, 而后者无人调用 →
+    配了 ALERT_WEBHOOK_URL 也不会推送(文档承诺与实际不符)。现由本函数统一推送:
+    配了 URL 且不属于"审计留痕"(audit_*)才推; 推送失败/未配置 → 静默降级为"仅落库"。
+    """
     with conn:
         conn.execute(
             "INSERT INTO alerts(org, task_id, model, level, error, created_at) VALUES(?,?,?,?,?,?)",
             (org, task_id, model, level, error[:500], int(time.time())),
         )
+    _push_webhook(conn, org, level, error, task_id, model)
+
+
+def _push_webhook(conn, org_id: str, level: str, error: str,
+                  task_id: int | None = None, model: str | None = None) -> bool:
+    """告警 webhook 推送: 读 app_config `alert.webhook_url`; 未配置/失败 → 只落库。"""
+    from env_tools import db as _db
+    try:
+        url = _db.get_app_config(conn, org_id, "alert.webhook_url", "") or ""
+    except Exception:
+        return False
+    if not url:
+        return False
+    if (error or "").split(":", 1)[0].strip() in ("audit_delete", "audit_delete_file",
+                                                  "audit_clear"):
+        return False                     # 只落库: 审计留痕不需要推送
+    try:
+        import requests
+        r = requests.post(url, json={"org": org_id, "level": level, "error": error[:500],
+                                     "task_id": task_id, "model": model,
+                                     "ts": int(time.time())}, timeout=10)
+        return r.status_code < 400
+    except Exception:
+        return False
 
 
 def cancel_task(conn: sqlite3.Connection, task_id: int) -> bool:

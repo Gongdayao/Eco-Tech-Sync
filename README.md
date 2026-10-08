@@ -43,7 +43,7 @@ Eco-Tech-Sync-V2/
 │   ├── reconcile.py         # 对账: 模型级矩阵 + 文件级纠正器 + 可见性/gated/采纳
 │   ├── transfer.py          # 传输: 只读拉取 + 建仓/上传/批量删除/基线回写
 │   ├── pipeline.py          # README 变换/front matter/license_map/init 检测
-│   ├── alerts.py            # 告警落库 + webhook + 每日摘要
+│   ├── alerts.py            # 告警查询与分类(落库/webhook 推送在 tasks.insert_alert)
 │   ├── gitcode.py           # GitCode 纯镜像(导入/删除/scan_and_fill)
 │   ├── runlog.py            # 每日日志导出: stdout 分流到 log/<YYYY-MM-DD>.log(逐行带时间戳, 跨零点自动换)
 │   ├── poison.py            # 毒瘤/隐藏文件: 任一路径段 '.' 开头恒排除; fetch 源头过滤(不返回/不落库)
@@ -95,7 +95,7 @@ ALERT_WEBHOOK_URL=""                             # 告警 webhook(可选)
   2026-10-08 新增:`sync.download_workers`(任务内下载并发)、`sync.stage_stale_days`(暂存清理天数, 默认 7)、
   `sync.cache_stale_days`(SDK 缓存清理天数, 默认 30)、`sync.file_retry_backoff_min` /
   `sync.file_retry_backoff_cap_h`(同步任务终态失败后的指数退避, 默认 30min 起 / 24h 上限);
-  `alert.webhook_url`(告警 webhook, 见 §10)。
+  `alert.webhook_url`(告警 webhook, 见 §5.11)。
 - ⚠ 种子化是 `INSERT OR IGNORE`:改 config.yaml 不影响**已存在**的 DB,需改 `app_config` 或删库重建。
 
 ## 5. 操作方法(全量)
@@ -365,6 +365,8 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | SDK 缓存目录(2026-10-08) | 每个进程首次下载前打印一次 `[transfer] SDK 缓存目录: 魔塔=… 魔乐=…`(便于确认缓存落在 weights 内) |
 | 复用/暂存(2026-10-08) | `下载完成(复用跳过)` / `暂存保留待重试(第 N/M 次)` / `上传前清理暂存残留 N 个` / `陈旧清理: …` |
 | 失败退避(2026-10-08) | 任务终态失败 → `[tasks] X 同步任务终态失败, 连续 N 次 → 退避 M 分钟后再试`; 第 3 次起写 `file_sync_backoff` 告警 |
+| 告警推送(2026-10-08 接线) | 所有告警经 `tasks.insert_alert` 落库; 配了 `ALERT_WEBHOOK_URL` 且**不属于"审计留痕"**(`audit_*`)时同步 POST 一次(超时 10s, 失败只降级为已落库)。此前 `dispatch_webhook` 无人调用, 配了也不会推 |
+| 备份/临时命名(2026-10-08) | 拉取阶段忽略 `.bak/.old/.sql/.swp/.tmp` 类命名(打印 `忽略 备份/临时命名 N 个`), 与隐藏文件同策略: **不比对/不同步/不删除** —— 天翼云 WAF 按路径模式拦这类下载(2026-09 曾让 531GB 反向同步 403 失败); 口径只含实测被拦的后缀, `.orig/.log/.zip` 等不误伤 |
 | stdout / stderr 约定 | stdout = 命令结果(JSON 模式为纯 JSON);stderr = 诊断(日志目录提示、配置警告、SDK 告警), 便于管道处理 |
 
 > systemd 部署务必设 `Environment=PYTHONUNBUFFERED=1`(见 §9.4), 否则 Python stdout 块缓冲会让
@@ -376,6 +378,7 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | 域 | 规则 |
 |---|---|
 | 准入 | repo 至少一个 `.safetensors` 才管理;魔塔 list 为准(魔塔对非权重 repo 隐身) |
+| 备份/临时命名 | `.bak/.old/.sql/.swp/.tmp`(后跟非字母数字或结尾, 大小写不敏感)视为**看不见**: 不比对/不同步/不删除, 拉取阶段即过滤并打印忽略清单。原因: 天翼云 WAF 按路径模式拦这类文件下载 → 2026-09-19 曾让 531GB 反向同步在下载阶段 403 失败(见 §5.11) |
 | 模型级新增 | 魔塔新增(有权重非 gated)→ 同步魔乐;魔乐独有权重 → 反向建塔(可见性参考魔乐);魔塔隐身存在 → 略过+告警一次 |
 | 模型级删除 | 魔塔 repo 消失(**模型级宽限 3 轮**, DB 曾有权重)→ 删魔乐 repo(无护栏)+ GitCode 对齐 + 清双侧行;魔塔本体人工网页删;魔乐缺 → 即时补齐 |
 | 文件级 | 调度(2026-09-14):队列生成只拉两侧 model_list, 仓级 `last_modified` 与 `models.files_verified_lm` 不一致即入队 file_batch(零文件树请求); 单仓的逐文件比对在任务执行时做。魔塔为准单向:增/改/魔乐缺(有基线行)→整批同步魔乐;**魔塔删 → 同轮整批删(无宽限, 对齐 v1: 先上传后删除)**;魔乐独有→**严格镜像自动删**(`auto_delete_extra=true`;关闭后为人工确认);不一致→魔塔版覆盖(**含跨端同名内容不一致**, 2026-09: 魔塔 sha256 vs 魔乐 sha256/LFS/local 基线, README 除外, 自动以魔塔版覆盖 + content_mismatch 告警)。存量缺失(魔乐基线无行且树上无)2026-09 起自动补(人工排查确认属纯缺失, 含整目录 TP1/t2v/optional; 子目录路径保真同步) |

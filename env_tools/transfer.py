@@ -162,6 +162,7 @@ def fetch_remote_files(conn, org, platform: str, model: str) -> list[dict]:
     与 v1 各阶段 startswith(".") 过滤一致; 调用方无需再按 poison 过滤。
     """
     out: list[dict] = []
+    skipped_backup: list[str] = []          # 备份/临时命名(WAF 高危) → 只记录, 不进管线
     repo_id = f"{org.scope.repo_name if platform == 'scope' else org.modelers.repo_name}/{model}"
     if platform == "scope":
         api = _scope_api(org)
@@ -172,8 +173,11 @@ def fetch_remote_files(conn, org, platform: str, model: str) -> list[dict]:
                 continue
             path = _get(f, "path", "")
             size = _get(f, "size", 0) or 0
-            if _poison.is_excluded(_poison.classify(path, size)):
-                continue                 # 源头过滤: 隐藏/毒瘤不进管线
+            _reason = _poison.classify(path, size)
+            if _poison.is_excluded(_reason):
+                if _reason == "backup":
+                    skipped_backup.append(path)
+                continue                 # 源头过滤: 隐藏/毒瘤/备份命名不进管线
             sha = _get(f, "sha256", None)
             out.append({
                 "platform": "scope",
@@ -199,8 +203,11 @@ def fetch_remote_files(conn, org, platform: str, model: str) -> list[dict]:
             if size is None:          # RepoFolder
                 continue
             path = _get(e, "path", "")
-            if _poison.is_excluded(_poison.classify(path, size or 0)):
-                continue                 # 源头过滤: 隐藏/毒瘤不进管线
+            _reason = _poison.classify(path, size or 0)
+            if _poison.is_excluded(_reason):
+                if _reason == "backup":
+                    skipped_backup.append(path)
+                continue                 # 源头过滤: 隐藏/毒瘤/备份命名不进管线
             lfs = _get(e, "lfs", None)
             blob = _get(e, "blob_id", None)
             if lfs is not None:
@@ -224,6 +231,9 @@ def fetch_remote_files(conn, org, platform: str, model: str) -> list[dict]:
             })
     else:
         raise ValueError(f"未知平台: {platform}(fetch_remote_files 仅 scope/modelers)")
+    if skipped_backup:
+        print(f"[transfer] {platform}/{model} 忽略 备份/临时命名 {len(skipped_backup)} 个"
+              f"(WAF 高危, 不比对/不同步/不删除): {skipped_backup[:5]}", flush=True)
     return out
 
 

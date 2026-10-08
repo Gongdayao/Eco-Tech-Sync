@@ -4,6 +4,7 @@
 分类结果(写入 files.poison 列):
   'platform' → 平台托管/隐藏文件: 恒排除 —— 不比对、不同步、不删除;
   'poison'   → P0 毒瘤: 不参与同步方向判断、本地绝不产生上传;
+  'backup'   → 备份/临时命名(WAF 高危): 同样"看不见" —— 不比对、不同步、不删除;
   None       → 正常文件, 参与同步。
 
 判定规则(P0):
@@ -19,7 +20,17 @@
 """
 from __future__ import annotations
 
+import re
+
 PLATFORM_MANAGED = {".gitattributes"}
+
+# 备份/临时命名(2026-10-08, 用户选 A「源头过滤」)
+# 事故: 2026-09-19 魔塔仓 media/README.md.bak-before-upload 让 531GB 反向同步在下载阶段
+# 吃到 403 —— 天翼云 WAF 按路径模式拦 `\.(bak|old|sql|swp|tmp)([^a-z0-9]|$)`(大小写不敏感),
+# SDK 重试 10 次后抛不可重试错误, 整任务失败(且当时只能人工清理仓库)。
+# 实测口径: `.bak-before-upload` 403; `.bakxyz`/`.orig`/`.log`/`.zip` 为 404(不拦)
+#   → 只按"已验证的 5 个后缀 + 非字母数字/结尾"过滤, 不凭感觉扩大(避免误伤正常文件)。
+_WAF_BACKUP_RE = re.compile(r"\.(bak|old|sql|swp|tmp)([^a-z0-9]|$)", re.I)
 
 
 def _is_hidden(path: str) -> bool:
@@ -43,9 +54,11 @@ def classify(path: str, size: int = 0) -> str | None:
             return "poison"
     if _is_hidden(path):
         return "platform"          # 全隐藏过滤(2026-09, 与 v1 对齐)
+    if _WAF_BACKUP_RE.search(name):
+        return "backup"            # 备份/临时命名: WAF 高危, 与隐藏文件同策略
     return None
 
 
 def is_excluded(reason: str | None) -> bool:
-    """platform/poison 都不参与对比与任务"""
-    return reason in ("platform", "poison")
+    """platform/poison/backup 都不参与对比与任务"""
+    return reason in ("platform", "poison", "backup")
