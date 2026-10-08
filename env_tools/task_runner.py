@@ -50,10 +50,16 @@ def _execute(conn, org, task, stub_fail: bool) -> None:
     if not org.scope.configured or not org.modelers.configured:
         raise RuntimeError(f"org '{org.id}' 缺少 scope/modelers 平台配置")
     from env_tools import transfer
-    if task["kind"] == tasks.KIND_MODEL_SYNC:
-        result = transfer.sync_model(conn, org, task)
-    elif task["kind"] == tasks.KIND_FILE_BATCH:
-        result = transfer.sync_files(conn, org, task)
+    if task["kind"] in (tasks.KIND_MODEL_SYNC, tasks.KIND_FILE_BATCH):
+        # 2026-10-08: 失败时保留暂存(供重试跳过下载/续传), 仅"终态失败"才清理
+        try:
+            if task["kind"] == tasks.KIND_MODEL_SYNC:
+                result = transfer.sync_model(conn, org, task)
+            else:
+                result = transfer.sync_files(conn, org, task)
+        except Exception as err:
+            transfer._maybe_clean_stage(conn, task, org.updown_dir(task["model"]), err)
+            raise
     elif task["kind"] == tasks.KIND_REPO_DELETE:
         result = transfer.delete_repo_task(conn, org, task)
     elif task["kind"] == tasks.KIND_GITCODE_IMPORT:

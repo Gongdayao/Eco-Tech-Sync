@@ -56,7 +56,15 @@ def bootstrap_env() -> None:
     if not os.environ.get("HUB_WHITE_LIST_PATHS"):
         os.environ["HUB_WHITE_LIST_PATHS"] = weights.rstrip("/") + "/"
     # 缓存与超时(可选, 与 v1 run.sh 行为对齐)
-    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(weights, ".openmind"))
+    # 2026-10-08: SDK 缓存统一收到 <weights>/.cache 下(可用 SYNC_CACHE_DIR 覆盖):
+    #   魔塔 modelscope_hub: MODELSCOPE_CACHE=<cache>/modelscope
+    #   魔乐 openmind_hub : XDG_CACHE_HOME=<cache> → OM_HUB_CACHE=<cache>/openmind/hub
+    #   (OM_HUB_CACHE 在 openmind_hub 1.3.0 里是模块常量, 只能靠 XDG_CACHE_HOME 调)
+    # 两个 SDK 的缓存都是内容寻址(sha256/etag), 跨组织共享即可, 不需要按组织分目录。
+    cache = os.environ.get("SYNC_CACHE_DIR") or os.path.join(weights, ".cache")
+    os.environ.setdefault("SYNC_CACHE_DIR", cache)
+    os.environ.setdefault("MODELSCOPE_CACHE", os.path.join(cache, "modelscope"))
+    os.environ.setdefault("XDG_CACHE_HOME", cache)
     os.environ.setdefault("DEFAULT_REQUEST_TIMEOUT", "600")
     # 魔塔端点: 裸 modelscope.cn openapi 突发会被 WAF 403(YUNWAF_CLIENT_UNCLASSIFIED),
     # 必须用 www.modelscope.cn; 同样在 import modelscope_hub 之前设置

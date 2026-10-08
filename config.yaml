@@ -23,6 +23,20 @@ orgs:
       repo_name: ${GITCODE_REPO_NAME}
       scope_base_url: "https://www.modelscope.cn/models/"
 
+  - id: FlashGen
+    weights_subdir: FlashGen            # 默认 = id; 本地暂存 weights_path/<subdir>/{compare,updown}_weights
+    scope:                              # ≈ v1 modelscope_cfg
+      repo_name: ${FLASHGEN_SCOPE_REPO_NAME}      # 魔塔组织名(须与平台上的建组名完全一致)
+      token: ${FLASHGEN_SCOPE_TOKEN}
+      license_name: "license"
+      license: ["Apache License 2.0", "MIT License", "GPL-2.0", "GPL-3.0", "LGPL-3.0", "other"]
+    modelers:                           # ≈ v1 modelers_cfg
+      repo_name: ${FLASHGEN_MODELERS_REPO_NAME}   # 魔乐组织名
+      token: ${FLASHGEN_MODELERS_TOKEN}
+      license_name: "license"
+      license: ["apache-2.0", "mit", "gpl-2.0", "gpl-3.0", "lgpl-3.0", "other"]
+    # 无 gitcode 块 → 该组织不做 GitCode 镜像(org.has_gitcode=False, 相关代码均已判空)
+
   # 新增组织示例: 每组织一套 .env 变量(<ORG_ID大写/连字符转下划线>_SCOPE_TOKEN 等)
   # - id: Gen_Line
   #   weights_subdir: Gen_Line
@@ -43,6 +57,13 @@ sync:
                                     # (魔塔 download_repo / 魔乐 snapshot_download 的 max_workers,
                                     #  对齐 v1 的 5; 任务与任务之间仍严格串行, 只并发任务内部)
   delete_grace_cycles: 3            # 【仅模型级】魔塔 repo 删除传播宽限轮数(文件级删除 2026-09 起无宽限, 对齐 v1)
+  upload_max_files: 0               # 【2026-10-08】单次 commit 的文件数上限(0 = 不分块, 旧行为)。
+                                    # 生产出现过"78 个 LFS 文件传完后 commit 端点 500 → 整批不落地,
+                                    # 下次重试重传一小时"; 设为 20 左右可让失败只丢一块, 其余已落地。
+  stage_stale_days: 7               # 暂存目录(updown_weights/compare_weights)超过 N 天未改动 → 清
+  cache_stale_days: 30              # SDK 缓存(<weights>/.cache) 超过 N 天未改动 → 清(复用基础, 阈值放宽)
+  file_retry_backoff_min: 30        # 【2026-10-08】文件级/模型级同步"终态失败"后指数退避起点(分钟)
+  file_retry_backoff_cap_h: 24      # 退避上限(小时); 退避期内不再重建任务(避免无限重试烧带宽)
   pipeline_max_models: 1
 
 transfer:

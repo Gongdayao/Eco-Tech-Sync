@@ -31,6 +31,12 @@ SCHEMA_VERSION 8 变更(2026-09-14, 对账调度重构): models 增加 files_ver
 真正的文件级比对(魔塔 1 次 list_repo_files + 魔乐 1 次 list_repo_tree)放到任务执行时按
 单仓做; 核验成功(无差异或同步成功)才回写该值 → 失败自动保持 dirty、下轮重入队。
 首次部署 / `audit --force` 仍走全量扫描(此时该列为 NULL = 全部 dirty)。
+
+SCHEMA_VERSION 9 变更(2026-10-08, 失败退避): models 增加 files_fail_count /
+files_retry_at —— 文件级/模型级同步任务**终态失败**后给该模型指数退避(默认 30min 起,
+上限 24h), 队列生成在退避期内不再重建任务。背景: 旧逻辑"失败不写 verified_lm → 保持
+dirty → 每轮重建任务"会把一个 54 分钟的大上传任务无限重试好几天(生产实测),
+既烧带宽又把镜像留在"部分更新"的残缺状态。
 """
 import os
 import sqlite3
@@ -40,7 +46,7 @@ import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "sync.db")
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 TASKS_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -112,6 +118,8 @@ CREATE TABLE IF NOT EXISTS models (
   gitcode_status TEXT,                             -- NULL/pending/imported/failed/skipped
   gitcode_checked_at INTEGER,
   files_verified_lm INTEGER,                       -- v8: 已核验文件树的那一版仓 last_modified
+  files_fail_count INTEGER NOT NULL DEFAULT 0,     -- v9: 文件级同步连续失败次数(退避用)
+  files_retry_at INTEGER,                          -- v9: 该模型下次可重试时间(退避期内不入队)
   PRIMARY KEY (org, platform, repo_id)
 );
 CREATE INDEX IF NOT EXISTS idx_models_fingerprint ON models (org, platform, last_modified);
@@ -242,6 +250,8 @@ def _ensure_known_columns(conn: sqlite3.Connection) -> None:
         ("files", "is_init", "is_init INTEGER NOT NULL DEFAULT 0"),
         ("files", "last_synced_at", "last_synced_at INTEGER"),
         ("models", "files_verified_lm", "files_verified_lm INTEGER"),
+        ("models", "files_fail_count", "files_fail_count INTEGER NOT NULL DEFAULT 0"),
+        ("models", "files_retry_at", "files_retry_at INTEGER"),
         ("files", "rehash_checked_at", "rehash_checked_at INTEGER"),
         ("files", "rehash_fail_count", "rehash_fail_count INTEGER NOT NULL DEFAULT 0"),
         ("files", "rehash_next_try_at", "rehash_next_try_at INTEGER"),

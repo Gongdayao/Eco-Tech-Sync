@@ -77,6 +77,9 @@ SCOPE_TOKEN=...  SCOPE_REPO_NAME=Eco-Tech        # 魔塔
 MODELERS_TOKEN=...  MODELERS_REPO_NAME=Eco-Tech  # 魔乐
 GITCODE_TOKEN=...  GITCODE_REPO_NAME=Eco-Tech    # GitCode(可选)
 ALERT_WEBHOOK_URL=""                             # 告警 webhook(可选)
+# SYNC_CACHE_DIR 可省略(2026-10-08): 两个 SDK 的缓存默认落在 <WEIGHTS_PATH>/.cache
+#   (魔塔 <cache>/modelscope; 魔乐 <cache>/openmind/hub)。缓存是"重试跳过下载"的基础,
+#   别随手删; 想换盘时设 SYNC_CACHE_DIR=<另一个盘的路径>。
 ```
 
 ### 4.2 `config.yaml`
@@ -86,6 +89,10 @@ ALERT_WEBHOOK_URL=""                             # 告警 webhook(可选)
   `sync.auto_delete_extra=true`(严格镜像:魔乐独有文件一律自动删;false=只告警人工确认)、
   `sync.forced_rehash_interval_d` / `sync.forced_rehash_batch`(强哈希复核周期与每轮上限)、
   `sync.delete_grace_cycles`(**仅模型级** repo 删除宽限轮数)、`sync.model_interval_min` 等;
+  2026-10-08 新增:`sync.download_workers`(任务内下载并发)、`sync.upload_max_files`
+  (单次 commit 文件数上限, 0=不分块; 生产建议 20)、`sync.stage_stale_days`(暂存清理天数, 默认 7)、
+  `sync.cache_stale_days`(SDK 缓存清理天数, 默认 30)、`sync.file_retry_backoff_min` /
+  `sync.file_retry_backoff_cap_h`(同步任务终态失败后的指数退避, 默认 30min 起 / 24h 上限);
 - ⚠ 种子化是 `INSERT OR IGNORE`:改 config.yaml 不影响**已存在**的 DB,需改 `app_config` 或删库重建。
 
 ## 5. 操作方法(全量)
@@ -352,6 +359,9 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | 提交清单日志 | 每次上传/删除 commit 列出文件清单(≤20 全列 + 计数 + 总量), 如 `[sync] X file_batch 删除(一次 commit): 75 个文件 (314.63 GB)` |
 | 逐文件进度 | 下载逐文件一行 `[sync] X 下载 3/77 (18.40/628.00 GB): path`; 上传/删除为批次粒度(一次 commit) |
 | 进度落库 | `tasks.progress/started_at`; 对账/强哈希进度写 `app_config` 的 `sync.reconcile_progress` / `sync.rehash_progress` |
+| SDK 缓存目录(2026-10-08) | 每个进程首次下载前打印一次 `[transfer] SDK 缓存目录: 魔塔=… 魔乐=…`(便于确认缓存落在 weights 内) |
+| 复用/暂存(2026-10-08) | `下载完成(复用跳过)` / `暂存保留待重试(第 N/M 次)` / `上传前清理暂存残留 N 个` / `陈旧清理: …` |
+| 失败退避(2026-10-08) | 任务终态失败 → `[tasks] X 同步任务终态失败, 连续 N 次 → 退避 M 分钟后再试`; 第 3 次起写 `file_sync_backoff` 告警 |
 | stdout / stderr 约定 | stdout = 命令结果(JSON 模式为纯 JSON);stderr = 诊断(日志目录提示、配置警告、SDK 告警), 便于管道处理 |
 
 > systemd 部署务必设 `Environment=PYTHONUNBUFFERED=1`(见 §9.4), 否则 Python stdout 块缓冲会让
@@ -371,6 +381,17 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | README | 2026-09 规则:魔塔**无 README** = 空白 → 不同步、不删魔乐 README、不告警;**不参与跨端同名内容比对与强哈希核对**(front matter/license 归一化导致裸哈希必然不同);**正文一致性单独校验**:每轮剥离 front matter 比正文, 不一致 → 自动以魔塔版覆盖魔乐 + `readme_body_mismatch` 留痕告警(每模型下载两侧 README 小文件比对; 已在待同步集则跳过);比较口径(2026-09-14):front matter 块**前后空行容忍**(兼容首行空行/BOM/CRLF)、正文取"第一行非空行 ~ 最后一行非空行"(**首尾空行容忍**), **正文内部空行与排版差异不容忍**(不逐行 rstrip、不折叠内部空行)——避免"首行空行致剥头失败→每轮空转"与"元数据被当正文写进目标卡片"两类问题;魔塔 init(空/模板)不同步;real → 变换同步魔乐(双向模型级上传前判 init, init 不传);魔乐 README 永不因独有删除;license 由建仓参数从魔塔元数据兜底传递 |
 | GitCode | 纯镜像:魔塔公开新增→导入(**返回驱动确认**, 对齐 v1);导入成功提示开启 pull(**仅同步器工作周期内导入的模型**, 非每日);魔塔删除确认→删除对齐;`scan_and_fill` 全量补齐 |
 
+### 6.1 下载复用 / 上传分块 / 失败退避(2026-10-08)
+
+生产问题驱动(一个 1.2TB 级任务在"上传 commit 500"后连续重试好几天, 反复重下+重传, 镜像长期
+残缺), 2026-10-08 定稿三条规则:
+
+| 机制 | 行为 | 依据(已实测) |
+|---|---|---|
+| **暂存不再每次清空** | 任务**成功才删**暂存; 失败保留, 下次重试由 SDK 校验后**跳过已下好的文件**、半截文件**断点续传**; **终态失败**(不可重试/次数用尽)才删 | 魔塔 `download_repo` 按清单 sha256 校验本地文件, 命中即跳过(断网也能走完); `<file>.incomplete` 带 `Range: bytes=<已下>-` 续传(实测); 魔乐 `local_dir` 模式不复用, 故改用**缓存模式**快照+硬链接(实测缓存可离线命中) |
+| **下载后自查 + 上传前 prune** | 下载完按 `size`(+必要时 blob sha1)逐文件自查, 不合格→逐文件兜底, 仍不合格→**任务失败**(绝不静默上传); 上传前把暂存归约成"本次期望集合", 清掉 `<file>.incomplete`/历史残留 | 魔塔 SDK 对单文件失败**只 warning 不抛错**(源码+实测); SDK 都不会清理残留文件, 而 `upload_folder` 会把目录里全部文件传上去 |
+| **终态失败指数退避** | 任务终态失败 → 该模型 `files_retry_at` 退避(30min → 1h → 2h … 上限 24h), 退避期内队列生成**不再重建任务**; 同步成功自动清零; 第 3 次失败写告警 | 旧逻辑"失败保持 dirty → 每轮重建任务"会把大任务无限重试, 烧带宽且长期留残缺镜像 |
+
 ## 7. 任务与状态机
 
 - 状态:`pending → claimed → running → succeeded/failed/interrupted/obsolete`;
@@ -379,18 +400,23 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 - **obsolete**:执行前预检源 repo 消失 → 作废(不占次数不告警);
 - **紧急抢占**:`enqueue --urgent`(priority=100)→ daemon 中断当前 worker → 重排(不消耗次数)优先执行;
 - 去重:同 dedup_key 非终态去重;终态任务可重建(新一轮差异可重新入队);
+- **失败退避(2026-10-08)**:同步任务**终态失败**后按模型指数退避
+  (`sync.file_retry_backoff_min` 起, `sync.file_retry_backoff_cap_h` 封顶), 退避期内队列生成
+  不再重建该模型任务(`status` 里体现为"退避中=N"); 同步成功后清零。避免"大任务失败→每轮重建→重烧带宽";
 - **per-model 租约**:同一 `(org, model)` 同时只允许一个 claimed/running 任务(跨 kind),
   防止模型级与文件级并发互踩(排队任务等它结束);
 - **进度可见**(2026-09):执行进度写 `tasks.progress`, 领取时刻 `tasks.started_at`, `status` 直接显示。
 
 ## 8. 本地 DB
 
-- `sync.db`(首次自动创建,WAL;当前 **SCHEMA_VERSION 6**):`models/files/tasks/alerts/app_config/license_map/heartbeat`;
+- `sync.db`(首次自动创建,WAL;当前 **SCHEMA_VERSION 9**):`models/files/tasks/alerts/app_config/license_map/heartbeat`;
 - 关键列:`tasks.progress/started_at`(执行进度/领取时刻)、`files.blob_id`(魔乐非 LFS 变更指纹)、
   `files.rehash_checked_at`(强哈希周期内已核验标记)、`files.rehash_fail_count`/
   `files.rehash_next_try_at`(强哈希失败计数与下次重试时间, 指数退避)、`files.sha256_source`(`api`/`local`/`none`)、
   `files.last_synced_at`(同步滞后)、`models.files_verified_lm`(v8: 该侧仓"已核验文件树"的
-  last_modified, 队列生成据此判 dirty; 任务成功后回写, 失败保持 dirty 下轮重入队);
+  last_modified, 队列生成据此判 dirty; 任务成功后回写, 失败保持 dirty 但按退避节奏重入队)、
+  `models.files_fail_count` / `models.files_retry_at`(v9: 同步连续失败次数与下次可重试时间,
+  退避期内队列生成跳过该模型);
 - 运行状态键:`app_config` 的 `sync.reconcile_progress` / `sync.rehash_progress`(供 `status` 展示);
 - 隐藏/毒瘤文件在 fetch 源头过滤、不落库(v4 迁移已清理历史遗留行);
 - **启动即 `migrate()`**(幂等): 补齐缺失的追加列(与版本号解耦)、按需重建 tasks、执行一次性数据迁移;
@@ -401,6 +427,16 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 ## 9. 部署(单机自用)
 
 > 形态:一台能访问魔塔/魔乐/GitCode 的 Linux 机器 + systemd 常驻。
+
+> **缓存目录(2026-10-08 起)**:两个 SDK 的缓存统一在 `<WEIGHTS_PATH>/.cache/` 下
+> (魔塔 `modelscope/`、魔乐 `openmind/hub`), 由 `env_bootstrap.py` 在 import SDK 之前设好
+> (`SYNC_CACHE_DIR` 可覆盖)。**升级到本版本后**:旧位置 `<WEIGHTS_PATH>/.openmind` 与
+> `~/.cache/modelscope` 会变成孤儿, 建议同盘 `mv` 迁移(或直接删, 缓存可再生):
+> ```bash
+> cd <project-dir> && mkdir -p weights/.cache
+> [ -d weights/.openmind/openmind ] && mv weights/.openmind/openmind weights/.cache/openmind
+> [ -d ~/.cache/modelscope ] && mv ~/.cache/modelscope weights/.cache/modelscope
+> ```
 > 下文占位符: `<repo-url>` / `<project-dir>` / `<conda-env>` / `<user>` / `<ORG>`。
 
 ### 9.1 获取代码与环境

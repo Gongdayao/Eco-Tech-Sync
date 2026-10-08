@@ -362,6 +362,8 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
 
     cur_scope = _active(cur_scope_raw)
     cur_modelers = _active(cur_modelers_raw)
+    out["cur_scope"] = cur_scope          # 2026-10-08: 供 file_batch 下载后自查使用
+    out["cur_modelers"] = cur_modelers
 
     db_s = {r["path"]: r for r in conn.execute(
         "SELECT * FROM files WHERE org=? AND platform='scope' AND repo_id=?", (org.id, scope_repo))}
@@ -721,14 +723,14 @@ def file_enqueue_from_lists(conn, org, now: int | None = None, seen: dict | None
     """
     now = now or _now()
     stat = {"managed": 0, "dirty": 0, "enq": 0, "clean": 0, "skip_pending": 0,
-            "skip_gated": 0, "dirty_nobaseline": 0, "dirty_names": []}
+            "skip_backoff": 0, "skip_gated": 0, "dirty_nobaseline": 0, "dirty_names": []}
     if not seen:
         return stat
     names = set(seen.get("scope", set())) & set(seen.get("modelers", set()))
     if not names:
         return stat
     rows = conn.execute(
-        "SELECT platform, name, last_modified, files_verified_lm, gated FROM models "
+        "SELECT platform, name, last_modified, files_verified_lm, gated, files_retry_at FROM models "
         "WHERE org=? AND platform IN ('scope','modelers')", (org.id,)).fetchall()
     sc = {r["name"]: r for r in rows if r["platform"] == "scope"}
     mo = {r["name"]: r for r in rows if r["platform"] == "modelers"}
@@ -771,6 +773,10 @@ def file_enqueue_from_lists(conn, org, now: int | None = None, seen: dict | None
             continue
         stat["dirty"] += 1
         stat["dirty_names"].append(f"{name}({'+'.join(dirty)})")
+        # 2026-10-08: 终态失败退避期内不再重建任务(否则一个 54min 的大任务会被无限重试好几天)
+        if rs["files_retry_at"] and int(rs["files_retry_at"]) > now:
+            stat["skip_backoff"] += 1
+            continue
         if name in pending:
             stat["skip_pending"] += 1
             continue
@@ -779,7 +785,8 @@ def file_enqueue_from_lists(conn, org, now: int | None = None, seen: dict | None
     _commit(conn)
     msg = (f"队列生成: 在管={stat['managed']} 变动={stat['dirty']}(其中无基线="
            f"{stat['dirty_nobaseline']}) 入队={stat['enq']} 已一致={stat['clean']} "
-           f"跳过(已有任务)={stat['skip_pending']} gated={stat['skip_gated']}")
+           f"跳过(已有任务)={stat['skip_pending']} 退避中={stat['skip_backoff']} "
+           f"gated={stat['skip_gated']}")
     print(f"[reconcile] {org.id} {msg}", flush=True)
     if stat["dirty_names"]:
         print(f"[reconcile] {org.id} 变动明细: {', '.join(stat['dirty_names'][:20])}"
@@ -1179,10 +1186,17 @@ def scheduler_tick(conn, orgs, now: int | None = None, force: bool = False) -> l
             # 时间戳 upsert(2026-09-14 修复 ①): 旧实现用 seed_app_config(INSERT OR IGNORE)
             # 只有首次写入生效 → 15min 节流在首次对账后永久失效(每个空转轮都跑整轮对账)
             db.set_app_config(conn, org.id, "sync.last_reconcile", now)
+            # 陈旧暂存/SDK 缓存清理(2026-10-08 fix 4): 对账只在任务队列为空时执行,
+            # 因此不会删到正在使用的目录
+            try:
+                from env_tools import transfer as _tr
+                r_sweep = _tr.sweep_stale_stage(conn, org, now)
+            except Exception as e:
+                r_sweep = {"removed": 0, "error": f"{type(e).__name__}: {e}"}
             idle_msg = f"空闲(上轮对账完成, 耗时 {_now() - t_tick}s)"
             db.set_runtime_state(conn, org.id, "sync.reconcile_progress", idle_msg)
             results.append({"org": org.id, "model": r_model, "queue": r_queue,
-                            "file": r_file, "rehash": r_rehash})
+                            "file": r_file, "rehash": r_rehash, "sweep": r_sweep})
         except Exception as e:
             db.set_runtime_state(conn, org.id, "sync.reconcile_progress",
                                  f"对账异常: {type(e).__name__}: {e}")

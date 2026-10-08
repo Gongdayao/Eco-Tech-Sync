@@ -139,6 +139,35 @@ def classify_error(err: str) -> bool:
     return not any(h in low for h in _NON_RETRYABLE_HINTS)
 
 
+def _bump_file_backoff(conn: sqlite3.Connection, task) -> None:
+    """同步任务**终态失败** → 该模型指数退避(2026-10-08 生产事故驱动)。
+
+    旧行为: 失败不写 files_verified_lm → 保持 dirty → 每轮重建任务。一个 54 分钟的大上传
+    任务因此被无限重试好几天(带宽烧光、镜像长期残缺)。现: 终态失败后按
+    `sync.file_retry_backoff_min`(默认 30min) 指数退避, 上限
+    `sync.file_retry_backoff_cap_h`(默认 24h); 队列生成在退避期内不再重建该模型任务,
+    同步成功后由 transfer._reset_file_fail 清零。
+    """
+    if task["kind"] not in (KIND_MODEL_SYNC, KIND_FILE_BATCH):
+        return
+    from env_tools import db as _db
+    base = int(_db.get_app_config(conn, task["org"], "sync.file_retry_backoff_min", 30)) * 60
+    cap = int(_db.get_app_config(conn, task["org"], "sync.file_retry_backoff_cap_h", 24)) * 3600
+    row = conn.execute("SELECT MAX(files_fail_count) AS n FROM models WHERE org=? AND name=?",
+                       (task["org"], task["model"])).fetchone()
+    n = int((row["n"] if row else 0) or 0) + 1
+    delay = min(base * (2 ** (n - 1)), cap)
+    with conn:
+        conn.execute("UPDATE models SET files_fail_count=?, files_retry_at=? "
+                     "WHERE org=? AND name=?", (n, int(time.time()) + delay,
+                                                task["org"], task["model"]))
+    print(f"[tasks] {task['model']} 同步任务终态失败, 连续 {n} 次 → 退避 {delay // 60} 分钟后再试")
+    if n == 3:
+        insert_alert(conn, task["org"], task["id"], task["model"], "warn",
+                     f"file_sync_backoff: 连续失败 {n} 次, 已按指数退避降频重试(上限 "
+                     f"{cap // 3600}h); 请检查平台端错误与仓库状态")
+
+
 def fail_task(conn: sqlite3.Connection, task_id: int, error: str,
               tail_backoff_s: int = 0) -> None:
     """失败处理 —— 三档重启制(不设执行时间上限, 见模块 docstring)。
@@ -162,6 +191,7 @@ def fail_task(conn: sqlite3.Connection, task_id: int, error: str,
         insert_alert(conn, task["org"], task_id, task["model"], "critical",
                      f"任务不可重试失败(尝试{task['attempts']}次): {err[:300]}")
         print(f"[tasks] ERROR task={task_id} 不可重试失败, 直接 failed: {err}")
+        _bump_file_backoff(conn, task)
         return
     if task["attempts"] >= task["max_attempts"]:
         with conn:
@@ -172,6 +202,7 @@ def fail_task(conn: sqlite3.Connection, task_id: int, error: str,
                      f"任务连续失败{task['attempts']}次, 停止拉起, 等待人工排查: {err[:300]}")
         print(f"[tasks] ERROR task={task_id} 连续失败{task['attempts']}次, "
               f"停止拉起, 等待人工排查: {err}")
+        _bump_file_backoff(conn, task)
         return
     if task["attempts"] == 1:
         # 第 1 次失败: 原位重启 —— next_retry_at=now, 优先级不变, 不排到最后

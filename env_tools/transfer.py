@@ -13,8 +13,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 
 from utils.ratelimit import global_limiter
@@ -289,17 +291,154 @@ def ensure_repo(conn, org, platform: str, model: str, license_kw: str | None = N
     return True
 
 
-def _download_one(org, src_platform: str, repo_id: str, path: str, dest_dir: str) -> None:
-    """单文件下载到 dest_dir(保持相对路径); 大文件由 SDK 自带断点/校验。"""
+_CACHE_LOGGED = False
+_UPLOAD_CACHE_FILE = ".ms_upload_cache"      # 魔塔上传器的本地"未变文件跳过"缓存
+
+
+def _sdk_caches() -> tuple[str, str]:
+    """两个 SDK 的实际缓存目录(仅用于日志与显式传参)。
+
+    env_bootstrap 已把它们统一到 <weights>/.cache 下(SYNC_CACHE_DIR 可覆盖):
+      魔塔 MODELSCOPE_CACHE=<cache>/modelscope; 魔乐 XDG_CACHE_HOME=<cache> → <cache>/openmind/hub
+    """
+    root = os.environ.get("SYNC_CACHE_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "weights", ".cache")
+    ms = os.environ.get("MODELSCOPE_CACHE") or os.path.join(root, "modelscope")
+    om = os.path.join(os.environ.get("XDG_CACHE_HOME") or root, "openmind", "hub")
+    return ms, om
+
+
+def _log_caches_once() -> None:
+    global _CACHE_LOGGED
+    if not _CACHE_LOGGED:
+        _CACHE_LOGGED = True
+        ms, om = _sdk_caches()
+        print(f"[transfer] SDK 缓存目录: 魔塔={ms} 魔乐={om}", flush=True)
+
+
+def _download_one(org, src_platform: str, repo_id: str, path: str, dest_dir: str,
+                  sha256: str | None = None) -> None:
+    """单文件下载到 dest_dir(保持相对路径); 复用本地/缓存, 不强制重下(2026-10-08)。
+
+    调用方(兜底路径)已把不合格的本地文件删掉, 否则魔塔 `download_file(expected_sha256=None)`
+    会因"文件存在"直接命中而跳过(源码 _cache_hit)。传入 sha256 时 SDK 还会做完整性校验。
+    """
     if src_platform == "scope":
         api = _scope_api(org)
         global_limiter.wait()
-        api.download_file(repo_id, "model", path, local_dir=dest_dir, force=True)
-    else:
-        from openmind_hub import om_hub_download
-        global_limiter.wait()
-        om_hub_download(repo_id, path, revision="main", token=org.modelers.token,
-                        local_dir=dest_dir, force_download=True)
+        api.download_file(repo_id, "model", path, local_dir=dest_dir, force=False,
+                          expected_sha256=sha256)
+        return
+    from openmind_hub import om_hub_download
+    _ms_cache, om_cache = _sdk_caches()
+    global_limiter.wait()
+    p = om_hub_download(repo_id, path, revision="main", token=org.modelers.token,
+                        cache_dir=om_cache, force_download=False)
+    dst = os.path.join(dest_dir, path)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        os.remove(dst)
+    try:
+        os.link(str(p), dst)              # 同盘: 零拷贝硬链接(缓存 ↔ 暂存)
+    except OSError:
+        shutil.copyfile(str(p), dst)
+
+
+def _norm_meta(size, sha, blob) -> tuple:
+    """归一化期望元数据 → (size, sha256_64|None, git_sha1_40|None)。"""
+    sha64 = sha if (sha and len(sha) == 64) else None
+    blob40 = next((c for c in (sha, blob) if c and len(c) == 40), None)
+    return (size, sha64, blob40)
+
+
+def _expected_meta(conn, org, platform: str, model: str, paths: list[str],
+                   expect: dict | None = None) -> dict:
+    """每文件的期望 (size, sha256_64, git_sha1_40) —— 供下载后自查。
+
+    优先级: 调用方给的**实时文件树**(expect, 最权威) > DB files 表基线。
+    两者都没有时 size/sha 均为 None → 自查阶段会拒绝该文件(绝不静默上传不确定内容)。
+    """
+    repo_id = _repo_id(org, platform, model)
+    out = {}
+    for p in paths:
+        row = conn.execute(
+            "SELECT size, sha256, blob_id FROM files WHERE org=? AND platform=? AND repo_id=? AND path=?",
+            (org.id, platform, repo_id, p)).fetchone()
+        out[p] = _norm_meta((row["size"] if row else None),
+                            (row["sha256"] or None) if row else None,
+                            (row["blob_id"] or None) if row else None)
+    for p, v in (expect or {}).items():
+        if p in out and v and any(v[:3]):
+            out[p] = _norm_meta(v[0], v[1] if len(v) > 1 else None,
+                                v[2] if len(v) > 2 else None)
+    return out
+
+
+def _git_blob_sha1(path: str) -> str:
+    """git blob sha1 = sha1("blob <len>\0" + 内容); 魔乐非 LFS blob_id 与魔塔 40 位形态同源。"""
+    size = os.path.getsize(path)
+    h = hashlib.sha1()
+    h.update(f"blob {size}\0".encode())
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_downloaded(dest_dir: str, paths: list[str], meta: dict,
+                         src_platform: str) -> list[str]:
+    """下载后自查, 返回不合格(缺失/尺寸不符/哈希不符)的 path。
+
+    为什么必须自查(2026-10-08 实测): 魔塔 `download_repo` 对单文件失败**只 warning 不抛错**,
+    不自查就会把缺失/半截文件上传。校验强度: size 必查; 内容哈希只在"SDK 无可信期望值"
+    (魔塔清单只给 40 位 blob 的少数文件)时自算, 其余交给 SDK 自带的 sha256/etag 校验,
+    避免每次重试把 TB 级文件全量读一遍。
+    """
+    bad = []
+    for p in paths:
+        fp = os.path.join(dest_dir, p)
+        if not os.path.isfile(fp):
+            bad.append(p)
+            continue
+        size, sha64, blob40 = meta.get(p, (None, None, None))
+        if not size and not sha64 and not blob40:
+            bad.append(p)               # 无任何期望元数据 → 无法校验, 拒绝放行
+            continue
+        if size and os.path.getsize(fp) != size:
+            bad.append(p)
+            continue
+        if src_platform == "scope" and not sha64 and blob40:
+            if _git_blob_sha1(fp) != blob40:
+                bad.append(p)
+    return bad
+
+
+def _prune_stage(stage: str, expected: set) -> list[str]:
+    """上传前把暂存目录归约成"期望集合", 返回被删清单。
+
+    必要性(2026-10-08 实测): 两个 SDK 都不清理 `<file>.incomplete` 等残留, 而
+    upload_folder 会传目录里的全部文件 → 不 prune 就会把半截/无关文件传到目标平台。
+    例外: 魔塔上传器的 `.ms_upload_cache` 保留(重试时用于跳过未变文件)。
+    """
+    removed = []
+    for root, _dirs, files in os.walk(stage):
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, stage)
+            if rel in expected or fn == _UPLOAD_CACHE_FILE:
+                continue
+            try:
+                os.remove(full)
+                removed.append(rel)
+            except OSError:
+                pass
+    for root, dirs, _files in os.walk(stage, topdown=False):
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except OSError:
+                pass
+    return removed
 
 
 def _progress(conn, task_id, text: str) -> None:
@@ -311,22 +450,46 @@ def _progress(conn, task_id, text: str) -> None:
         pass
 
 
-def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
-                  dest_dir: str, on_file=None) -> int:
-    """整批下载: **任务内部并发**(借用平台 SDK 的并发快照池), 缺失时回退逐文件。
+def _download_modelers_snapshot(org, repo_id: str, paths: list[str], dest_dir: str,
+                                workers: int) -> None:
+    """魔乐源: **缓存模式**快照下载, 再把文件硬链接/复制进暂存目录。
 
-    2026-09-15 修复(用户定稿原则: 任务与任务之间串行, 任务内部借用平台 SDK 并行):
-      旧实现 `for path in paths: _download_one(...)` 是逐文件串行 —— 实测 8.73GB 用
-      8 分多钟(≈20MB/s), 打不满带宽; v1 走的是 `snapshot_download(max_workers=5)`。
-      现按源侧选择 SDK 并发接口:
-        魔塔: `HubApi.download_repo(repo_id, repo_type='model', local_dir, allow_patterns, max_workers)`
-        魔乐: `openmind_hub.snapshot_download(repo_id, repo_type='model', local_dir,
-               allow_patterns, force_download=True, local_dir_use_symlinks=False, max_workers)`
-      并发度 = app_config `sync.download_workers`(默认 5, 对齐 v1)。
-      `allow_patterns` 传精确路径(含 TP1/… 嵌套路径实测可行), 不下载本次无关文件。
-      并发后逐文件进度由 SDK 自己的 tqdm 输出; on_file 仍按原契约回调
-      (开始一次 / 回退时逐文件 / 批次完成一次), 供 DB 进度与日志使用。
-      任一文件缺失 → 回退逐个补齐; 仍失败 → 抛错(任务失败, 不进入上传)。
+    2026-10-08 实测(openmind-hub 1.3.0):
+      - `snapshot_download(local_dir=…)` 模式**既不校验本地文件也不写缓存** → 重试必然重下;
+      - 去掉 local_dir(缓存模式)+ `force_download=False` → 缓存按 etag 校验并命中(断网可完成);
+      - 故这里用缓存模式, 再 os.link(同盘零拷贝)/copyfile 落到暂存目录。
+    """
+    from openmind_hub import snapshot_download
+    _ms_cache, om_cache = _sdk_caches()
+    global_limiter.wait()
+    snap = snapshot_download(repo_id, repo_type="model", revision="main",
+                             allow_patterns=list(paths), cache_dir=om_cache,
+                             force_download=False, local_dir_use_symlinks=False,
+                             token=org.modelers.token, max_workers=workers)
+    for p in paths:
+        s_path = os.path.join(str(snap), p)
+        d_path = os.path.join(dest_dir, p)
+        os.makedirs(os.path.dirname(d_path), exist_ok=True)
+        if os.path.exists(d_path):
+            os.remove(d_path)
+        try:
+            os.link(s_path, d_path)
+        except OSError:
+            shutil.copyfile(s_path, d_path)
+
+
+def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
+                  dest_dir: str, on_file=None, expect: dict | None = None) -> int:
+    """整批下载(任务内并发) + **复用/续传** + 下载后自查。
+
+    2026-10-08 定稿(目标: 上传失败重试不再重复下载):
+      - 暂存目录由调用方保留(见 _maybe_clean_stage): 完整文件由 SDK 校验后**跳过**,
+        半截文件由 SDK **续传**(魔塔实测 `Range: bytes=<已下>-`, `.incomplete`);
+      - 魔塔源: `download_repo(local_dir=stage, allow_patterns=全部 paths)`
+        SDK 按清单 sha256 逐个校验, 命中即跳过(实测: 断网也能完成);
+      - 魔乐源: 缓存模式(见 _download_modelers_snapshot);
+      - 下载后自查 size(+必要时 blob sha1): 魔塔 SDK 对单文件失败只 warning 不抛错;
+      - 不合格 → 逐文件兜底; 兜底后仍不合格 → 抛错(任务失败, 暂存保留待重试)。
     """
     paths = [p for p in paths if p]
     if not paths:
@@ -334,87 +497,200 @@ def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
     from env_tools import db as _db
     repo_id = _repo_id(org, src_platform, model)
     n = len(paths)
-    sizes = {}
-    for p in paths:
-        row = conn.execute(
-            "SELECT size FROM files WHERE org=? AND platform=? AND repo_id=? AND path=?",
-            (org.id, src_platform, repo_id, p)).fetchone()
-        sizes[p] = (row["size"] if row else 0) or 0
+    meta = _expected_meta(conn, org, src_platform, model, paths, expect=expect)
+    if any(not any(meta.get(p, ())[:3] or ()) for p in paths):
+        print(f"[transfer] {src_platform}/{model} 警告: 部分文件无期望 size/hash, "
+              f"下载后自查会拒绝它们(宁可失败也不静默上传)", flush=True)
+    sizes = {p: (meta.get(p, (0, None, None))[0] or 0) for p in paths}
     total = sum(sizes.values())
     workers = int(_db.get_app_config(conn, org.id, "sync.download_workers", 5))
     os.makedirs(dest_dir, exist_ok=True)
-    api_name = "download_repo" if src_platform == "scope" else "snapshot_download"
-    print(f"[transfer] {src_platform}/{model} 并发下载 {n} 个文件 ({total / 1e9:.2f} GB): "
-          f"{api_name}(allow_patterns={n}, max_workers={workers}, 任务内并发)", flush=True)
+    _log_caches_once()
+    api_name = "download_repo" if src_platform == "scope" else "snapshot_download(cache)"
+    print(f"[transfer] {src_platform}/{model} 下载 {n} 个文件 ({total / 1e9:.2f} GB): "
+          f"{api_name}(allow_patterns={n}, max_workers={workers}, 复用+续传)", flush=True)
     if on_file is not None:
         try:
-            on_file(0, n, f"并发下载开始({api_name}, max_workers={workers})")
+            on_file(0, n, f"下载开始({api_name}, max_workers={workers})")
         except Exception:
             pass
-    missing: list[str] = list(paths)
+    err = None
     try:
-        global_limiter.wait()
         if src_platform == "scope":
+            global_limiter.wait()
             _scope_api(org).download_repo(repo_id, repo_type="model", revision="master",
                                           local_dir=dest_dir, allow_patterns=list(paths),
                                           max_workers=workers)
         else:
-            from openmind_hub import snapshot_download
-            snapshot_download(repo_id, repo_type="model", revision="main",
-                              local_dir=dest_dir, allow_patterns=list(paths),
-                              force_download=True, local_dir_use_symlinks=False,
-                              token=org.modelers.token, max_workers=workers)
-        missing = [p for p in paths if not os.path.isfile(os.path.join(dest_dir, p))]
-    except Exception as e:
-        print(f"[transfer] {src_platform}/{model} 并发下载异常 → 回退逐文件: "
+            _download_modelers_snapshot(org, repo_id, paths, dest_dir, workers)
+    except Exception as e:                     # 网络/接口异常 → 逐文件兜底
+        err = e
+        print(f"[transfer] {src_platform}/{model} 批量下载异常 → 逐文件兜底: "
               f"{type(e).__name__}: {e}", flush=True)
-        missing = list(paths)
-    done = n - len(missing)
-    for p in list(missing):                      # 回退补齐(保留"失败即抛"语义)
-        _download_one(org, src_platform, repo_id, p, dest_dir)
-        done += 1
+    bad = _validate_downloaded(dest_dir, paths, meta, src_platform)
+    if err is None and not bad:
+        print(f"[transfer] {src_platform}/{model} 下载完成(复用跳过): {n}/{n} "
+              f"({total / 1e9:.2f} GB)", flush=True)
         if on_file is not None:
             try:
-                on_file(done, n, p)
+                on_file(n, n, paths[-1])
             except Exception:
                 pass
-    print(f"[transfer] {src_platform}/{model} 并发下载完成: {done}/{n} 个文件 "
-          f"({total / 1e9:.2f} GB)"
-          + (f", 其中回退逐文件 {len(missing)} 个" if missing else ""), flush=True)
-    if on_file is not None and not missing:
+        return n
+    if bad:
+        print(f"[transfer] {src_platform}/{model} 下载后自查不合格 {len(bad)} 个"
+              f"(示例 {bad[:3]}), 逐文件兜底", flush=True)
+    for p in list(bad):
+        fp = os.path.join(dest_dir, p)
+        if os.path.exists(fp):
+            os.remove(fp)          # 先删不合格文件, 否则 SDK 可能"存在即命中"跳过
+        _download_one(org, src_platform, repo_id, p, dest_dir,
+                      sha256=(meta.get(p, (None, None, None))[1]))
+    bad2 = _validate_downloaded(dest_dir, paths, meta, src_platform)
+    if bad2:
+        raise RuntimeError(f"下载校验失败 {len(bad2)} 个文件(示例 {bad2[:3]}); 暂存目录保留待重试")
+    print(f"[transfer] {src_platform}/{model} 下载完成(兜底补齐 {len(bad)} 个): {n}/{n}", flush=True)
+    if on_file is not None:
         try:
-            on_file(n, n, paths[-1])             # 批次完成 → 调用方刷新进度/日志
+            on_file(n, n, paths[-1])
         except Exception:
             pass
-    return done
+    return n
 
 
 def _upload_dir(org, dst_platform: str, model: str, folder: str,
-                commit_msg: str) -> None:
-    """整批上传(一次 commit); 并发由 SDK 内部池负责, 不做 work 级并发。
+                commit_msg: str, conn=None) -> None:
+    """整批上传; 按 `sync.upload_max_files` 分块(每块一次 commit), 并发由 SDK 内部池负责。
 
-    接口(打印出来便于审计, 2026-09-15):
-      魔塔: `HubApi.upload_folder(..., max_workers=5, 一次 commit)`
-      魔乐: `openmind_hub.upload_folder(...)`(SDK 内部 pipeline 批量, 日志可见
-            `Adaptive batch size` / `pipeline mode`)
+    2026-10-08(生产事故驱动): 出现过"78 个 LFS 文件全部传完后 commit 端点 500"→ 整批不落地、
+    下次重试重传一小时。分块后单块失败只丢该块, 其余块已落地(下一轮对账只补剩余)。
+    `upload_max_files=0`(默认)= 不分块(旧行为); 大权重建议设 20 左右。
+    接口: 魔塔 `HubApi.upload_folder(..., max_workers=5)`; 魔乐 `openmind_hub.upload_folder(...)`。
     """
+    from env_tools import db as _db
     repo_id = _repo_id(org, dst_platform, model)
-    n_files = sum(len(fs) for _r, _d, fs in os.walk(folder))
-    if dst_platform == "scope":
-        api = _scope_api(org)
-        print(f"[transfer] 魔塔 upload_folder(repo_id={repo_id}, files={n_files}, "
-              f"max_workers=5, 一次 commit): {commit_msg}", flush=True)
-        global_limiter.wait()
-        api.upload_folder(repo_id, "model", folder_path=folder, max_workers=5,
-                          disable_tqdm=True, commit_message=commit_msg,
-                          ignore_patterns=[".git", "*.tmp", ".*~"])
-    else:
-        from openmind_hub import upload_folder
-        print(f"[transfer] 魔乐 upload_folder(repo_id={repo_id}, files={n_files}, "
-              f"一次 commit(并发由 SDK pipeline 负责)): {commit_msg}", flush=True)
-        global_limiter.wait()
-        upload_folder(repo_id, folder_path=folder, token=org.modelers.token,
-                      commit_message=commit_msg)
+    flist = sorted(
+        os.path.relpath(os.path.join(r, f), folder)
+        for r, _d, fs in os.walk(folder) for f in fs
+        if f != _UPLOAD_CACHE_FILE)
+    if not flist:
+        return
+    cap = int(_db.get_app_config(conn, org.id, "sync.upload_max_files", 0)) if conn is not None else 0
+    chunks = [flist] if cap <= 0 else [flist[i:i + cap] for i in range(0, len(flist), cap)]
+    for idx, chunk in enumerate(chunks, 1):
+        part = folder
+        if len(chunks) > 1:
+            # 分块: 硬链接组一个只含本块文件的临时目录(保持相对路径), 上传后删掉
+            part = os.path.join(os.path.dirname(folder), f".part_{os.path.basename(folder)}_{idx}")
+            shutil.rmtree(part, ignore_errors=True)
+            for rel in chunk:
+                s_path, d_path = os.path.join(folder, rel), os.path.join(part, rel)
+                os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                try:
+                    os.link(s_path, d_path)
+                except OSError:
+                    shutil.copyfile(s_path, d_path)
+        tag = f"[{idx}/{len(chunks)}]" if len(chunks) > 1 else ""
+        try:
+            if dst_platform == "scope":
+                api = _scope_api(org)
+                print(f"[transfer] 魔塔 upload_folder(repo_id={repo_id}, files={len(chunk)}{tag}, "
+                      f"max_workers=5, 一次 commit): {commit_msg}", flush=True)
+                global_limiter.wait()
+                api.upload_folder(repo_id, "model", folder_path=part, max_workers=5,
+                                  disable_tqdm=True, commit_message=f"{commit_msg} {tag}".strip(),
+                                  ignore_patterns=[".git", "*.tmp", ".*~", _UPLOAD_CACHE_FILE])
+            else:
+                from openmind_hub import upload_folder
+                print(f"[transfer] 魔乐 upload_folder(repo_id={repo_id}, files={len(chunk)}{tag}, "
+                      f"一次 commit(并发由 SDK pipeline 负责)): {commit_msg}", flush=True)
+                global_limiter.wait()
+                upload_folder(repo_id, folder_path=part, token=org.modelers.token,
+                              commit_message=f"{commit_msg} {tag}".strip())
+        finally:
+            if part != folder:
+                shutil.rmtree(part, ignore_errors=True)
+
+
+def _maybe_clean_stage(conn, task, stage: str, err: BaseException | None) -> str:
+    """暂存目录生命周期(2026-10-08 定稿): 成功→删; 失败且还会重试→保留; 终态失败→删。
+
+    保留的意义: 下次尝试由 SDK 校验后跳过已下好的文件、半截文件续传(实测), 不再从零重下。
+    """
+    from env_tools import tasks as _t
+    keep = False
+    attempts = max_attempts = 0
+    if err is not None:
+        t = dict(task)
+        attempts = int(t.get("attempts") or 0)
+        max_attempts = int(t.get("max_attempts") or 3)
+        retryable = _t.classify_error(f"{type(err).__name__}: {err}")
+        keep = retryable and attempts < max_attempts
+    if keep:
+        print(f"[transfer] 暂存保留待重试(第 {attempts}/{max_attempts} 次): {stage}", flush=True)
+        return "kept"
+    shutil.rmtree(stage, ignore_errors=True)
+    return "cleaned"
+
+
+def _reset_file_fail(conn, org, model: str) -> None:
+    """同步成功 → 清该模型的失败计数与退避(与 tasks.fail_task 的退避配对)。"""
+    conn.execute("UPDATE models SET files_fail_count=0, files_retry_at=NULL "
+                 "WHERE org=? AND name=?", (org.id, model))
+    conn.commit()
+
+
+def sweep_stale_stage(conn, org, now: int | None = None) -> dict:
+    """清理陈旧暂存与缓存(2026-10-08 fix 4)。
+
+    - `updown_weights/<model>`、`compare_weights/<model>`: 超过 `sync.stage_stale_days`
+      (默认 7 天)未改动 → 删(失败任务保留的暂存也受约束, 避免长期占盘);
+    - SDK 缓存(`<weights>/.cache/*` 下 models--* 目录): 超过 `sync.cache_stale_days`
+      (默认 30 天)未改动 → 删(缓存是复用基础, 阈值放宽; 删除只损失"下次重下")。
+    对账只在任务队列为空时执行 → 不会删到正在使用的目录。
+    """
+    import time as _t
+    from env_tools import db as _db
+    now = now or int(_t.time())
+    stage_days = int(_db.get_app_config(conn, org.id, "sync.stage_stale_days", 7))
+    cache_days = int(_db.get_app_config(conn, org.id, "sync.cache_stale_days", 30))
+    removed: list[str] = []
+
+    def _newest_mtime(path: str) -> float:
+        newest = 0.0
+        for r, ds, fs in os.walk(path):
+            for x in list(fs) + list(ds):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(r, x)))
+                except OSError:
+                    pass
+        try:
+            newest = max(newest, os.path.getmtime(path))
+        except OSError:
+            pass
+        return newest
+
+    def _sweep(root: str, days: int) -> None:
+        if not os.path.isdir(root):
+            return
+        for name in os.listdir(root):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            if now - _newest_mtime(full) > days * 86400:
+                shutil.rmtree(full, ignore_errors=True)
+                removed.append(os.path.relpath(full, org.weights_root))
+
+    for sub in ("updown_weights", "compare_weights"):
+        _sweep(os.path.join(org.weights_root, sub), stage_days)
+    ms_cache, om_cache = _sdk_caches()
+    for cache in (ms_cache, om_cache):
+        _sweep(cache, cache_days)
+    if removed:
+        print(f"[transfer] 陈旧清理({org.id}): 暂存>{stage_days}d / 缓存>{cache_days}d → "
+              f"{len(removed)} 个目录: {removed[:5]}", flush=True)
+    return {"removed": len(removed), "names": removed[:20]}
+
 
 
 def _refresh_baselines(conn, org, model: str, now: int | None = None) -> None:
@@ -658,7 +934,8 @@ def sync_model(conn, org, task) -> dict:
     model = task["model"]
     now = int(_t.time())
     stage = org.updown_dir(model)
-    shutil.rmtree(stage, ignore_errors=True)
+    # 2026-10-08: 不再每次清空暂存 —— 失败重试时由 SDK 校验后跳过已下好的文件、
+    # 半截文件续传(实测断网也能走完"全部跳过"), 避免 TB 级权重反复重下。
     os.makedirs(stage, exist_ok=True)
 
     # 1) 源文件集合(排除毒瘤/平台托管; README 单独走管线)
@@ -693,16 +970,26 @@ def sync_model(conn, org, task) -> dict:
               f"({done / 1e9:.2f}/{total_bytes / 1e9:.2f} GB): {path}", flush=True)
 
     if paths:
-        _download_set(conn, org, src, model, paths, stage, on_file=_on_dl)
+        # 期望元数据取源侧实时文件树(最权威) → 下载后自查(魔塔 SDK 会吞掉单文件失败)
+        _expect = {f["path"]: (f.get("size"), f.get("sha256"), f.get("blob_id"))
+                   for f in normal}
+        _download_set(conn, org, src, model, paths, stage, on_file=_on_dl, expect=_expect)
     if readme is not None:
         _readme_download_and_stage(conn, org, src, dst, model, stage)
+
+    # 3.5) 上传前 prune: 只保留"期望集合"(本次 paths + README)
+    #      实测两个 SDK 都不清理 <file>.incomplete 等残留, 而 upload_folder 会全传上去
+    expected = set(paths) | ({"README.md"} if readme is not None else set())
+    pruned = _prune_stage(stage, expected)
+    if pruned:
+        print(f"[transfer] {model} 上传前清理暂存残留 {len(pruned)} 个: {pruned[:5]}", flush=True)
 
     # 4) 上传(一次 commit)
     if os.listdir(stage):
         _progress(conn, task_id, f"上传 {len(paths)} 个文件 ({total_bytes / 1e9:.2f} GB, 一次 commit)")
         print(f"[sync] {model} model_sync 开始批量上传 {len(paths)} 个文件 "
               f"({total_bytes / 1e9:.2f} GB, 一次 commit) ...", flush=True)
-        _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}")
+        _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}", conn=conn)
 
     # 5) 校验 + 6) 回写基线(含 last_synced_at 标记目标侧)
     _refresh_baselines(conn, org, model, now)
@@ -712,7 +999,8 @@ def sync_model(conn, org, task) -> dict:
     if readme is not None:
         synced.append("README.md")
     _mark_synced(conn, org.id, dst, _repo_id(org, dst, model), synced, now)
-    shutil.rmtree(stage, ignore_errors=True)
+    _maybe_clean_stage(conn, task, stage, None)      # 成功 → 删暂存(2026-10-08 policy A)
+    _reset_file_fail(conn, org, model)               # 成功 → 清失败退避
     _log_list(f"{model} model_sync {src}→{dst} 上传(一次 commit)", synced,
               total_bytes=sum(sizes.get(p, 0) for p in synced))
     return {"ok": True, "uploaded": len(paths) + (1 if readme is not None else 0),
@@ -788,8 +1076,7 @@ def sync_files(conn, org, task) -> dict:
     #    (先上传后删除 —— 任务执行窗口内魔乐只会"多文件"不会"缺文件")
     ups = sorted(p for p in d["to_modelers"] if p != "README.md")
     stage = org.updown_dir(model)
-    shutil.rmtree(stage, ignore_errors=True)
-    os.makedirs(stage, exist_ok=True)
+    os.makedirs(stage, exist_ok=True)    # 2026-10-08: 不再清空(失败重试由 SDK 校验跳过/续传)
     uploaded: list[str] = []
     task_id = task["id"]
     _ups_sizes: dict[str, int] = {}
@@ -806,20 +1093,28 @@ def sync_files(conn, org, task) -> dict:
         print(f"[sync] {model} 下载 {i}/{n} ({done / 1e9:.2f}/{_total_up / 1e9:.2f} GB): {path}",
               flush=True)
 
-    try:
-        if ups:
-            _download_set(conn, org, "scope", model, ups, stage, on_file=_on_dl)
-        if "README.md" in d["to_modelers"]:
-            _readme_download_and_stage(conn, org, "scope", "modelers", model, stage)
-        if os.listdir(stage):
-            _progress(conn, task_id, f"上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)")
-            print(f"[sync] {model} 开始批量上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)",
-                  flush=True)
-            _upload_dir(org, "modelers", model, stage, f"sync v2 file_batch: {model} →modelers")
-            uploaded = ups + (["README.md"] if "README.md" in d["to_modelers"] else [])
-            _progress(conn, task_id, f"上传完成 {len(uploaded)} 个文件")
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
+    if ups:
+        _expect = {p: (r.get("size"), r.get("sha256"), r.get("blob_id"))
+                   for p, r in (d.get("cur_scope") or {}).items()}
+        _download_set(conn, org, "scope", model, ups, stage, on_file=_on_dl, expect=_expect)
+    if "README.md" in d["to_modelers"]:
+        _readme_download_and_stage(conn, org, "scope", "modelers", model, stage)
+    # 上传前 prune: 只保留"期望集合"(本次 ups + README)
+    expected = set(ups) | ({"README.md"} if "README.md" in d["to_modelers"] else set())
+    _pruned = _prune_stage(stage, expected)
+    if _pruned:
+        print(f"[transfer] {model} 上传前清理暂存残留 {len(_pruned)} 个: {_pruned[:5]}", flush=True)
+    if os.listdir(stage):
+        _progress(conn, task_id, f"上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)")
+        print(f"[sync] {model} 开始批量上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)",
+              flush=True)
+        _upload_dir(org, "modelers", model, stage,
+                    f"sync v2 file_batch: {model} →modelers", conn=conn)
+        uploaded = ups + (["README.md"] if "README.md" in d["to_modelers"] else [])
+        _progress(conn, task_id, f"上传完成 {len(uploaded)} 个文件")
+    # 2026-10-08: 成功 → 删暂存 + 复位失败退避; 失败 → 暂存保留待重试(task_runner 决定终态清理)
+    _maybe_clean_stage(conn, task, stage, None)
+    _reset_file_fail(conn, org, model)
     if uploaded:
         _log_list(f"{model} file_batch 上传(一次 commit)", uploaded,
                   total_bytes=sum(_ups_sizes.get(p, 0) for p in uploaded))
