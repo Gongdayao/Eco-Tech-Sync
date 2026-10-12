@@ -326,6 +326,28 @@ def _log_caches_once() -> None:
         print(f"[transfer] SDK 缓存目录: 魔塔={ms} 魔乐={om}", flush=True)
 
 
+def _materialize(src: str, dst: str) -> None:
+    """把缓存里的文件落到暂存目录(魔乐缓存快照里是**相对符号链接**)。
+
+    2026-10-12 修复(生产回归): 原先直接 `os.link(snap/<file>, dst)` —— Linux 上 os.link
+    **不解引用符号链接**, 于是暂存里落下的是指向 `<stage>/../../blobs/<etag>` 的**断链**
+    (实测 islink=True, isfile=False), 自查判不合格、兜底又犯同一个错 → 反向同步必失败。
+    现在: 先 realpath 解到真实 blob → 硬链接(同盘零拷贝); 失败(跨盘/只读) → copyfile;
+    最后断言落盘必须是"真实文件"(存在且非符号链接), 否则抛错, 绝不把断链交给上传。
+    """
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    real = os.path.realpath(src)                 # ★ 关键: 解引用到真实 blob
+    if os.path.isfile(real):
+        try:
+            os.link(real, dst)                   # 硬链接真实文件(不是符号链接本身)
+        except OSError:
+            shutil.copyfile(real, dst)           # 跨盘/不支持硬链接 → 按内容复制
+    if not os.path.isfile(dst) or os.path.islink(dst):
+        raise RuntimeError(f"落盘校验失败(断链或非真实文件): {src} → {dst}")
+
+
 def _download_one(org, src_platform: str, repo_id: str, path: str, dest_dir: str,
                   sha256: str | None = None) -> None:
     """单文件下载到 dest_dir(保持相对路径); 复用本地/缓存, 不强制重下(2026-10-08)。
@@ -344,14 +366,7 @@ def _download_one(org, src_platform: str, repo_id: str, path: str, dest_dir: str
     global_limiter.wait()
     p = om_hub_download(repo_id, path, revision="main", token=org.modelers.token,
                         cache_dir=om_cache, force_download=False)
-    dst = os.path.join(dest_dir, path)
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if os.path.exists(dst):
-        os.remove(dst)
-    try:
-        os.link(str(p), dst)              # 同盘: 零拷贝硬链接(缓存 ↔ 暂存)
-    except OSError:
-        shutil.copyfile(str(p), dst)
+    _materialize(str(p), os.path.join(dest_dir, path))
 
 
 def _norm_meta(size, sha, blob) -> tuple:
@@ -407,8 +422,8 @@ def _validate_downloaded(dest_dir: str, paths: list[str], meta: dict,
     bad = []
     for p in paths:
         fp = os.path.join(dest_dir, p)
-        if not os.path.isfile(fp):
-            bad.append(p)
+        if os.path.islink(fp) or not os.path.isfile(fp):
+            bad.append(p)               # 符号链接/断链/缺失: 暂存必须是真实文件
             continue
         size, sha64, blob40 = meta.get(p, (None, None, None))
         if not size and not sha64 and not blob40:
@@ -467,7 +482,8 @@ def _download_modelers_snapshot(org, repo_id: str, paths: list[str], dest_dir: s
     2026-10-08 实测(openmind-hub 1.3.0):
       - `snapshot_download(local_dir=…)` 模式**既不校验本地文件也不写缓存** → 重试必然重下;
       - 去掉 local_dir(缓存模式)+ `force_download=False` → 缓存按 etag 校验并命中(断网可完成);
-      - 故这里用缓存模式, 再 os.link(同盘零拷贝)/copyfile 落到暂存目录。
+      - 故这里用缓存模式, 再用 _materialize(realpath→硬链接真实 blob / 复制)落到暂存目录
+        (⚠ 缓存快照里是相对符号链接, 直接 os.link 会落下断链: 2026-10-12 生产回归教训)。
     """
     from openmind_hub import snapshot_download
     _ms_cache, om_cache = _sdk_caches()
@@ -477,15 +493,7 @@ def _download_modelers_snapshot(org, repo_id: str, paths: list[str], dest_dir: s
                              force_download=False, local_dir_use_symlinks=False,
                              token=org.modelers.token, max_workers=workers)
     for p in paths:
-        s_path = os.path.join(str(snap), p)
-        d_path = os.path.join(dest_dir, p)
-        os.makedirs(os.path.dirname(d_path), exist_ok=True)
-        if os.path.exists(d_path):
-            os.remove(d_path)
-        try:
-            os.link(s_path, d_path)
-        except OSError:
-            shutil.copyfile(s_path, d_path)
+        _materialize(os.path.join(str(snap), p), os.path.join(dest_dir, p))
 
 
 def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
