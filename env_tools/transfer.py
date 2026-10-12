@@ -560,8 +560,8 @@ def _download_set(conn, org, src_platform: str, model: str, paths: list[str],
               f"(示例 {bad[:3]}), 逐文件兜底", flush=True)
     for p in list(bad):
         fp = os.path.join(dest_dir, p)
-        if os.path.exists(fp):
-            os.remove(fp)          # 先删不合格文件, 否则 SDK 可能"存在即命中"跳过
+        if os.path.lexists(fp):
+            os.remove(fp)          # 先删不合格文件(含 dangling 符号链接), 否则 SDK 可能"存在即命中"跳过
         _download_one(org, src_platform, repo_id, p, dest_dir,
                       sha256=(meta.get(p, (None, None, None))[1]))
     bad2 = _validate_downloaded(dest_dir, paths, meta, src_platform)
