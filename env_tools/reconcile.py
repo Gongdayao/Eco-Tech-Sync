@@ -42,6 +42,20 @@ def _is_sha256(v) -> bool:
 
 def _enqueue(conn, org_id: str, kind: str, model: str,
              direction: str | None = None) -> bool:
+    """入队(带**统一退避门禁**)。
+
+    2026-10-12: 失败退避原先只加在文件级队列生成里(`file_enqueue_from_lists`), 而模型级
+    (`model_level` 的 4 处 `_enqueue`)不看退避 → 像 531GB 反向 model_sync 失败后仍会**每轮
+    重建任务**(与"避免无限重试烧带宽"的初衷不符)。现收敛到本函数:
+      - kind ∈ {model_sync, file_batch} 且该模型仍在退避期内 → 跳过(返回 False);
+      - repo_delete(魔塔删除传播, 已有 3 轮宽限)/gitcode_import 不受影响。
+    文件级队列生成里仍保留同样的判断 —— 那是为了把"退避中"计数展示在日志里。
+    """
+    if kind in (tasks.KIND_MODEL_SYNC, tasks.KIND_FILE_BATCH):
+        row = conn.execute("SELECT MAX(files_retry_at) AS t FROM models "
+                           "WHERE org=? AND name=?", (org_id, model)).fetchone()
+        if row and row["t"] and int(row["t"]) > _now():
+            return False
     _, created = tasks.enqueue_task(conn, org_id, kind, model,
                                     direction=direction, created_by="reconcile")
     return created

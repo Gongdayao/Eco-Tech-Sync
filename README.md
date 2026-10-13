@@ -24,14 +24,14 @@
 - **GitCode 纯镜像**:新增导入(返回驱动确认,对齐 v1)+ pull 开启提醒(仅同步器工作周期内导入的模型)
   + 删除对齐 + 全量补齐(scan_and_fill),平台侧 pull 自同步;
 - **可见性(2026-09 补强)**:任务进度落库(`status` 显示"下载 i/N (x/y GB)"与已耗时)、`status --watch`
-  实时刷新、对账/强哈希进度落库、每日日志文件、`alerts` 告警查询、`clean` 人工清理;
+  实时刷新、对账/强哈希进度落库、每日日志文件、`alerts` 告警查询、`clean` 人工清理、`retry` 批量重启失败任务;
 - **审计与统计**:全量元数据落库(org 隔离)、操作即落库审计(`audit_*` 告警类型)、`status`/`audit`/`alerts` 命令。
 
 ## 2. 目录结构
 
 ```
 Eco-Tech-Sync-V2/
-├── server-work.py           # 顶层入口: daemon/once/enqueue/status/alerts/cancel/audit/clean
+├── server-work.py           # 顶层入口: daemon/once/enqueue/status/alerts/cancel/audit/clean/retry
 ├── config.yaml              # 多组织配置(${VAR} 注入, 密钥在 .env)
 ├── .env                     # 密钥(勿提交/外传)
 ├── requirements.txt         # 锁定依赖
@@ -111,7 +111,7 @@ cd <项目根>
 
 | 参数 | 说明 |
 |---|---|
-| `mode` | `daemon` / `once` / `enqueue` / `status` / `alerts` / `cancel` / `audit` / `clean`(缺省 = daemon) |
+| `mode` | `daemon` / `once` / `enqueue` / `status` / `alerts` / `cancel` / `audit` / `clean` / `retry`(缺省 = daemon) |
 | `--config PATH` | 指定 config.yaml(默认项目根 config.yaml) |
 | `--org ID` | 组织过滤(默认全部组织) |
 | `--force` | `audit`:忽略 15min 对账节流强制执行(默认受节流; daemon 不适用) |
@@ -336,6 +336,7 @@ python server-work.py daemon           # 前台常驻(调试); Ctrl-C = 优雅�
 | 取消误入队任务 | `cancel --task-id N` |
 | 查看任务详情/错误 | `status --status failed`(看 last_error) |
 | 清理魔乐独有旧文件 | `clean --org O --model X`(dry-run)→ 加 `--yes` 执行 |
+| 批量重启失败任务 | `retry`(dry-run 列表)→ `retry --yes` 重建 + 清退避;可 `--org/--kind/--model/--limit` 过滤 |
 
 ### 5.10 clean — 清理魔乐独有文件(人工确认/兜底)
 
@@ -373,6 +374,18 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 > 日志滞留在内存里、journal 长时间不刷新(2026-09 实测)。
 
 
+### 5.12 retry — 批量重启失败任务(2026-10-12)
+
+```bash
+python server-work.py retry                                   # dry-run: 列出全部 failed 任务
+python server-work.py retry --org Eco-Tech --kind file_batch --limit 20
+python server-work.py retry --org Eco-Tech --yes              # 真正重建 + 清该模型失败退避
+```
+- 语义: 对每条 `failed` 任务调用 `enqueue_task`(终态行删除重建 = 重启), 并把该模型的
+  `files_fail_count/files_retry_at` 清零 → **自动对账也一并恢复**;
+- 默认 dry-run, `--yes` 才落库(与 `clean` 一致);
+- ⚠ 不指定 `--kind` 时也会重建 `repo_delete`(重新尝试删除魔乐仓);只想动文件级就加 `--kind file_batch`。
+
 ## 6. 同步规则速览
 
 | 域 | 规则 |
@@ -406,9 +419,11 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 - **obsolete**:执行前预检源 repo 消失 → 作废(不占次数不告警);
 - **紧急抢占**:`enqueue --urgent`(priority=100)→ daemon 中断当前 worker → 重排(不消耗次数)优先执行;
 - 去重:同 dedup_key 非终态去重;终态任务可重建(新一轮差异可重新入队);
-- **失败退避(2026-10-08)**:同步任务**终态失败**后按模型指数退避
+- **失败退避(2026-10-08, 2026-10-12 收紧)**:同步任务**终态失败**后按模型指数退避
   (`sync.file_retry_backoff_min` 起, `sync.file_retry_backoff_cap_h` 封顶), 退避期内队列生成
-  不再重建该模型任务(`status` 里体现为"退避中=N"); 同步成功后清零。避免"大任务失败→每轮重建→重烧带宽";
+  不再重建该模型任务(`status` 里体现为"退避中=N"); 同步成功后清零。避免"大任务失败→每轮重建→重烧带宽"。
+  2026-10-12 起门禁统一在 `reconcile._enqueue`: **模型级 `model_sync` 与文件级 `file_batch` 都受退避约束**
+  (`repo_delete`/`gitcode_import` 不受影响); 想立刻重试用 `retry --yes` 或 `enqueue`(手动入队不受退避限制);
 - **per-model 租约**:同一 `(org, model)` 同时只允许一个 claimed/running 任务(跨 kind),
   防止模型级与文件级并发互踩(排队任务等它结束);
 - **进度可见**(2026-09):执行进度写 `tasks.progress`, 领取时刻 `tasks.started_at`, `status` 直接显示。

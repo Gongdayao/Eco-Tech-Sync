@@ -551,6 +551,51 @@ def cmd_audit(args) -> int:
     return rc
 
 
+def cmd_retry(args) -> int:
+    """批量重启失败任务(2026-10-12 新增; 默认 dry-run, `--yes` 才执行)。
+
+    背景: 以前只能 `status --status failed` 看清单 + 逐个 `enqueue --org X --model Y`,
+    没有批量入口。本命令:
+      - 过滤: --org / --kind / --model / --limit(都可选, 不填=全部失败任务);
+      - `--yes`: 逐个 enqueue_task 重建(终态行删除重建 = 重启) + 清该模型失败退避
+        (清退避后自动对账也恢复);
+      - 默认 dry-run 只打印清单(对齐 `clean` 的安全习惯)。
+    ⚠ 不加 --kind 时也会重建 repo_delete(会重新尝试删魔乐仓); 只想动文件级就加 --kind file_batch。
+    """
+    from env_tools import tasks as _tasks
+    raw_cfg, orgs, conn = _init(args.config)
+    q = ("SELECT id, org, kind, model, direction, attempts, last_error FROM tasks "
+         "WHERE status='failed'")
+    params: list = []
+    if args.org:
+        q += " AND org=?"; params.append(args.org)
+    if args.kind:
+        q += " AND kind=?"; params.append(args.kind)
+    if args.model:
+        q += " AND model=?"; params.append(args.model)
+    q += " ORDER BY id"
+    if args.limit:
+        q += " LIMIT ?"; params.append(int(args.limit))
+    rows = conn.execute(q, params).fetchall()
+    print(f"[retry] 失败任务 {len(rows)} 个" + ("" if args.yes else "  (dry-run; 加 --yes 执行)"))
+    for r in rows:
+        print(f"  task={r['id']:>5} {r['org']}/{r['model']} {r['kind']} "
+              f"dir={r['direction'] or '-'} attempts={r['attempts']} "
+              f"err={(r['last_error'] or '')[:70]}")
+        if not args.yes:
+            continue
+        tid, created = _tasks.enqueue_task(conn, r["org"], r["kind"], r["model"],
+                                           direction=r["direction"], created_by="manual_retry")
+        conn.execute("UPDATE models SET files_fail_count=0, files_retry_at=NULL "
+                     "WHERE org=? AND name=?", (r["org"], r["model"]))
+        print(f"      → 重建 task={tid} (新建={created}), 退避已清")
+    if args.yes and rows:
+        conn.commit()
+        print(f"[retry] 完成: {len(rows)} 个任务已重建, 退避已清; "
+              f"daemon 在跑会立刻领取, 否则用 once 或 start")
+    return 0
+
+
 def cmd_clean(args) -> int:
     """删除某模型在魔乐的"独有文件"(魔塔当前文件集没有的 path) —— 人工确认执行入口。
 
@@ -619,7 +664,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="同步器 v2(多组织) — 可运行骨架")
     ap.add_argument("mode", nargs="?", default="daemon",
                     choices=["daemon", "once", "enqueue", "status", "alerts",
-                             "cancel", "audit", "clean"],
+                             "cancel", "audit", "clean", "retry"],
                     help="默认 daemon(兼容 run.sh 无参启动)")
     ap.add_argument("--config", default=None, help=f"配置文件(默认 {DEFAULT_CONFIG})")
     # 通用
@@ -643,7 +688,7 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="audit: 忽略 15min 对账节流强制执行(默认受节流; 仅 audit 使用)")
     ap.add_argument("--yes", action="store_true",
-                    help="clean: 真正执行删除(默认 dry-run 只列清单)")
+                    help="clean/retry: 真正执行(默认 dry-run 只列清单)")
     ap.add_argument("--watch", type=int, nargs="?", const=5, default=None,
                     help="status: 每 N 秒实时刷新(默认 5s, Ctrl+C 退出)")
     ap.add_argument("--json", action="store_true", help="status/alerts: JSON 输出")
@@ -663,6 +708,7 @@ def main() -> int:
         "cancel": cmd_cancel,
         "audit": cmd_audit,
         "clean": cmd_clean,
+        "retry": cmd_retry,
     }
     if args.mode == "enqueue" and (not args.org or not args.model):
         ap.error("enqueue 必填: --org 与 --model")
