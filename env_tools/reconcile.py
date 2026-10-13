@@ -61,6 +61,15 @@ def _enqueue(conn, org_id: str, kind: str, model: str,
     return created
 
 
+def _has_scope_rebuild(conn, org_id: str, model: str) -> bool:
+    """该模型是否有"魔乐→魔塔"反向建塔任务在飞(pending/claimed/running)。"""
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE org=? AND model=? AND kind='model_sync' "
+        "AND direction='to_scope' AND status IN ('pending','claimed','running') LIMIT 1",
+        (org_id, model)).fetchone()
+    return row is not None
+
+
 def _alert_once(conn, org_id: str, model: str, prefix: str, level: str, msg: str) -> None:
     """同类同模型告警去重: alerts 表 error LIKE '前缀%' 已存在则不再重复。"""
     row = conn.execute(
@@ -116,7 +125,8 @@ def model_level(conn, org, now: int | None = None) -> dict:
             "repo_delete": 0, "adopted": 0, "skip_no_weights": 0, "skip_gated": 0,
             "gated_no_modelers": 0, "gated_hidden": 0, "gated_public": 0,
             "gated_converted": 0,
-            "dual_upload": 0, "vis_mismatch": 0, "adopted_names": [], "seen": {}}
+            "dual_upload": 0, "vis_mismatch": 0, "adopted_names": [], "seen": {},
+            "scope_shell": 0, "skip_rebuild": 0}
 
     if not org.scope.configured:
         return stat
@@ -209,10 +219,19 @@ def model_level(conn, org, now: int | None = None) -> dict:
         except Exception:
             continue                    # 网络异常本轮略过
         if scope_exists:
-            stat["dual_upload"] += 1
-            _alert_once(conn, org.id, name, "dual_upload", "warn",
-                        "魔乐独有权重但魔塔 repo_exists=True(隐身/初始化中): "
-                        "同权重疑似双端上传, 已略过; 待魔塔 list 出现后接管")
+            # 2026-10-12 安全闸(用户定稿): 魔塔 repo 存在但**不在魔塔 list** → 按准入规则
+            # (没有 .safetensors 的仓在魔塔 list 中隐身)判定为"空壳/隐身仓" → 按"魔乐独有"
+            # **反向建塔**, 而不是像旧逻辑只告警把活留给人工。同时清 missing_since, 且 step 3
+            # 见到"该模型有 to_scope 任务在飞"会跳过删除传播 → 不会把魔乐镜像删掉。
+            stat["scope_shell"] += 1
+            _alert_once(conn, org.id, name, "scope_shell_rebuild", "warn",
+                        "魔塔存在空壳/隐身仓(无 .safetensors, 不在魔塔 list), "
+                        "已按魔乐独有反向建塔(to_scope)")
+            conn.execute("UPDATE models SET missing_since=NULL WHERE org=? AND name=?",
+                         (org.id, name))
+            _commit(conn)
+            if _enqueue(conn, org.id, tasks.KIND_MODEL_SYNC, name, "to_scope"):
+                stat["to_scope"] += 1
             continue
         if _enqueue(conn, org.id, tasks.KIND_MODEL_SYNC, name, "to_scope"):
             stat["to_scope"] += 1
@@ -226,6 +245,11 @@ def model_level(conn, org, now: int | None = None) -> dict:
             continue                    # gated 不传播删除
         if not _db_had_weights(conn, org.id, name):
             continue                    # 从未有权重 → 不管
+        # 2026-10-12 安全闸: 魔乐仍有该模型且已有 to_scope 反向建塔任务在飞 → 不传播删除
+        # (空壳仓/上传中断场景下, 删镜像会把唯一的完整副本删掉)
+        if name in modelers_names and _has_scope_rebuild(conn, org.id, name):
+            stat["skip_rebuild"] += 1
+            continue
         if r["missing_since"] is None:
             conn.execute("UPDATE models SET missing_since=? WHERE org=? AND platform='scope' AND name=?",
                          (now, org.id, name))
@@ -352,7 +376,8 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
     modelers_repo = f"{org.modelers.repo_name}/{model}"
     out = {"adopt": False, "abort": False, "to_modelers": set(), "extra": set(),
            "missing_scope": set(), "readme": {"scope": False, "modelers": False},
-           "readme_body_mismatch": False}
+           "readme_body_mismatch": False,
+           "delete_blocked": [], "scope_weights_missing": False}
 
     try:
         cur_scope_raw = {f["path"]: f for f in fetch_remote_files(conn, org, "scope", model)}
@@ -543,6 +568,26 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
                     _alert_once(conn, org.id, model, "readme_body_mismatch", "warn",
                                 "两侧 README 正文不一致(front matter 之外), 已自动以魔塔版覆盖魔乐; "
                                 "如为有意差异请在魔塔侧修改")
+
+    # ---- 安全闸(2026-10-12 用户定稿): 魔塔当前文件集"一个 .safetensors 都没有"而魔乐有
+    #      → 魔塔侧是空壳/被清空, 此时严格镜像会把魔乐权重全删掉(Kimi 334 文件被删的同类风险)。
+    #      本模型本轮**拒绝任何删除**(extra 独有 + missing_scope 魔塔已删), 只留 critical 告警。
+    #      注意: 只拦"魔塔 0 个权重"这种退化态; "魔塔有权重但数量少于魔乐"仍按严格镜像执行
+    #      (那是 2026-09 用户定稿的政策, 不能靠数量猜意图)。 ----
+    scope_w = [p for p in cur_scope if p.endswith(".safetensors")]
+    modelers_w = [p for p in cur_modelers if p.endswith(".safetensors")]
+    if not scope_w and modelers_w:
+        blocked = sorted(out["extra"] | out["missing_scope"])
+        out["extra"].clear()
+        out["missing_scope"].clear()
+        out["delete_blocked"] = blocked
+        out["scope_weights_missing"] = True
+        if blocked:
+            print(f"[reconcile] {model} 安全闸: 魔塔无任何 .safetensors 而魔乐有 "
+                  f"{len(modelers_w)} 个 → 拒绝删除 {len(blocked)} 个文件(防残缺镜像)", flush=True)
+            _alert_once(conn, org.id, model, "scope_weights_missing", "critical",
+                        f"魔塔文件集无任何 .safetensors(空壳/被清空)而魔乐有 {len(modelers_w)} 个 → "
+                        f"本轮拒绝删除 {len(blocked)} 个(防残缺镜像); 请人工确认魔塔侧")
 
     # ---- 基线刷新(变化/纠正路径保留旧指纹, 待 worker 成功回写) ----
     _upsert_file_rows(conn, org.id, "scope", scope_repo, list(cur_scope_raw.values()), now, keep_scope)
