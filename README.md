@@ -281,7 +281,7 @@ python server-work.py alerts --resolve --org Eco-Tech --level critical --yes  # 
 | 审计留痕 | `audit_delete` / `audit_delete_file` / `audit_clear` | 同步器操作记录,无需处理 |
 | 需人工 | `delete_manual` / `vis_mismatch` / `gated_public_on_modelers`(critical) / `gated_converted` / `scope_delete_manual` / `scope_weights_missing`(critical, 魔塔 0 权重已禁删) / `rehash_mismatch` / `rehash_download_failed`(强哈希连续 3 次下载失败, 已按指数退避继续重试) | 需到平台人工处理(删除/可见性/gated/权威集完整性; `rehash_download_failed` 多为文件不可下载, 确认后可忽略) |
 | 任务失败 | critical: 不可重试失败 / 连续失败 N 次 / [紧急任务失败] | 带 task_id,配合 `status --status failed` 反查 |
-| 提醒 | GitCode 镜像导入 → 开启 pull(仅导入时一次);`content_mismatch`(跨端同名不一致, 已自动以魔塔版覆盖);`readme_body_mismatch`(README 正文不一致, 已自动以魔塔版覆盖);`readme_adopt_overwrite`(采纳期 README 分歧已按魔塔版覆盖);`scope_shell_rebuild`(魔塔空壳仓已自动反向建塔);`file_sync_backoff`(同步任务连续失败已降频重试) | 知悉即可(会自动收敛) |
+| 提醒 | GitCode 镜像导入 → 开启 pull(仅导入时一次);`content_mismatch`(跨端同名不一致, 已自动以魔塔版覆盖);`readme_body_mismatch`(README 正文不一致, 已自动以魔塔版覆盖);`readme_adopt_overwrite`(采纳期 README 分歧已按魔塔版覆盖);`scope_shell_rebuild`(魔塔空壳仓已自动反向建塔);`file_sync_backoff`(同步任务连续失败已降频重试);`readme_verify_pending`(回读校验: 权重已过, 仅 README 暂未在目标树可见) | 知悉即可(会自动收敛) |
 
 task_id 列可与 `python server-work.py status --status failed`(或直接查 tasks 表)联动定位具体任务。
 
@@ -454,7 +454,7 @@ python server-work.py task rm --status obsolete --older-than 7 --yes   # 清理 
 |---|---|---|
 | **暂存不再每次清空** | 任务**成功才删**暂存; 失败保留, 下次重试由 SDK 校验后**跳过已下好的文件**、半截文件**断点续传**; **终态失败**(不可重试/次数用尽)才删 | 魔塔 `download_repo` 按清单 sha256 校验本地文件, 命中即跳过(断网也能走完); `<file>.incomplete` 带 `Range: bytes=<已下>-` 续传(实测); 魔乐 `local_dir` 模式不复用, 故改用**缓存模式**快照+硬链接(实测缓存可离线命中) |
 | **下载后自查 + 上传前 prune** | 下载完按 `size`(+必要时 blob sha1)逐文件自查, 不合格→逐文件兜底, 仍不合格→**任务失败**(绝不静默上传); 上传前把暂存归约成"本次期望集合", 清掉 `<file>.incomplete`/历史残留 | 魔塔 SDK 对单文件失败**只 warning 不抛错**(源码+实测); SDK 都不会清理残留文件, 而 `upload_folder` 会把目录里全部文件传上去 |
-| **上传后回读校验**(2026-10-14 补实现) | 上传后拉目标侧文件树核对: 目标侧有 64 位内容哈希(魔塔全文件/魔乐 LFS)→ 与源 `sha256` 强校验; 只有 40 位 `blob_id`(魔乐非 LFS)→ `size` + blob 存在性; README 只校验存在。索引延迟 5s×3 次重试, **仍不一致或拉不到目标树 → 任务失败, 不写基线** | 设计 §5.2-6 原先只有注释没有代码(假安全); 现在"成功"= 目标侧内容已核对 |
+| **上传后回读校验**(2026-10-14 补实现; 当日二修分级) | 上传后拉目标侧文件树核对**权重/元数据**: 目标侧有 64 位内容哈希(魔塔全文件/魔乐 LFS)→ 与源 `sha256` 强校验; 只有 40 位 `blob_id`(魔乐非 LFS)→ `size` + blob 存在性; 索引延迟 **10s×5 次**(最长约 1 分钟)重试, 仍不一致或拉不到目标树 → **任务失败, 不写基线**。**README.md 单列**: 内容经管线变换(哈希必然不同)只判可见性, 暂未可见**不阻塞** → 记 `readme_verify_pending` 告警, 基线照写 | 二修背景: 生产实测"同一提交里其余 23 个文件都可见、唯 README >15s 不可见" → 曾把成功的 40GB 同步误判为失败; README 由独立管线每轮自愈 |
 | **终态失败指数退避** | 任务终态失败 → 该模型 `files_retry_at` 退避(30min → 1h → 2h … 上限 24h), 退避期内队列生成**不再重建任务**; 同步成功自动清零; 第 3 次失败写告警 | 旧逻辑"失败保持 dirty → 每轮重建任务"会把大任务无限重试, 烧带宽且长期留残缺镜像 |
 
 ## 7. 任务与状态机

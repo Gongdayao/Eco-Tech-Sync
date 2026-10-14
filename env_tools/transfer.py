@@ -452,22 +452,27 @@ def _verify_uploaded(org, dst_platform: str, model: str, expect: dict,
       - 目标侧给出 64 位内容哈希(魔塔全文件 / 魔乐 LFS)→ 与源 sha256 **强校验**;
       - 目标侧只有 40 位 blob_id(魔乐非 LFS)→ 校验 size 相等 + blob_id 存在;
       - README.md 只校验"存在"(内容是 README 管线变换产物, 哈希必然与源不同)。
-    平台索引有秒级延迟 → 不一致时 5s 后重读, 共 3 次; 仍不一致才判失败(任务失败, 不写基线)。
-    成本: 目标侧 1~3 次 list 请求。
+    **README 单列(2026-10-14 二修, 生产误判驱动)**: README 是文档类文件, 平台索引通常最慢
+    (实测: 提交里含 README, 其他 23 个文件都可见、唯独 README.md >15s 仍不可见), 且 README 有
+    独立管线(init 判定/front matter 变换/每轮正文比对)会自行收敛 → **README 缺失不判任务失败**,
+    仅通过返回值回报, 由调用方记 `readme_verify_pending` 告警。
+    权重/元数据窗口放大到 **5 次 × 10s**(最长约 1 分钟), 仍不一致或拉不到目标树 → 返回 bad/抛错。
+    返回值: `(bad_paths, readme_missing)`。成本: 目标侧 1~5 次 list 请求。
     """
     import time as _t
     if not expect and not readme_staged:
-        return []
+        return [], False
     bad: list[str] = []
     read_ok = False
-    for attempt in range(3):
+    readme_missing = False
+    for attempt in range(5):
         try:
             files = fetch_remote_files(None, org, dst_platform, model)
             read_ok = True
         except Exception as e:
             print(f"[transfer] {model} 回读校验: 拉目标树失败({type(e).__name__}: {e}), 重试",
                   flush=True)
-            _t.sleep(5)
+            _t.sleep(10)
             continue
         target = {f["path"]: f for f in files}
         bad = []
@@ -485,20 +490,36 @@ def _verify_uploaded(org, dst_platform: str, model: str, expect: dict,
                     bad.append(p)
                 elif not t.get("blob_id"):
                     bad.append(p)
-        if readme_staged and "README.md" not in target:
-            bad.append("README.md")
+        # README 单列: 不参与"任务失败"判定, 只回报是否已在目标树可见(索引延迟容忍)
+        readme_missing = bool(readme_staged and "README.md" not in target)
         if not bad:
             print(f"[transfer] {model} 回读校验通过: {len(expect)} 个文件"
-                  + (" + README" if readme_staged else ""), flush=True)
-            return []
-        if attempt < 2:
+                  + (" + README" if readme_staged and not readme_missing else "")
+                  + ("(README 暂未可见 → 记告警不阻塞)" if readme_missing else ""), flush=True)
+            return [], readme_missing
+        if attempt < 4:
             print(f"[transfer] {model} 回读校验不一致 {len(bad)} 个(示例 {bad[:3]}), "
-                  f"5s 后重试({attempt + 2}/3)", flush=True)
-            _t.sleep(5)
+                  f"10s 后重试({attempt + 2}/5)", flush=True)
+            _t.sleep(10)
     if not read_ok:
         # 拉不到目标树 = 无法确认 → 必须失败(绝不静默放行), 由调用方按任务失败处理
-        raise RuntimeError(f"回读校验无法完成: 目标树 {dst_platform}/{model} 连续 3 次拉取失败")
-    return bad
+        raise RuntimeError(f"回读校验无法完成: 目标树 {dst_platform}/{model} 连续 5 次拉取失败")
+    return bad, readme_missing
+
+
+def _warn_readme_pending(conn, org, model: str, dst_platform: str) -> None:
+    """README 上传后暂未在目标树出现 → 只告警不阻塞(2026-10-14 定稿)。
+
+    README 是文档类文件: 平台索引最慢(实测提交后 >15s 不可见), 且有独立管线
+    (init 判定 / front matter 变换 / 每轮正文比对)会自行收敛 → 不该拖死权重同步。
+    权重/元数据缺失仍走"任务失败"(见 _verify_uploaded)。
+    """
+    from env_tools.reconcile import _alert_once          # 复用告警去重(7 天窗口 + 可复位)
+    _alert_once(conn, org.id, model, "readme_verify_pending", "warn",
+                f"上传后目标树({dst_platform})暂未见 README.md(索引延迟或未上传); "
+                f"权重/元数据校验已通过, 基线已回写; 下一轮 README 管线会自行收敛")
+    print(f"[transfer] {model} 回读校验: README.md 暂未出现在目标树({dst_platform}) → "
+          f"记 readme_verify_pending 告警, 不阻塞基线回写", flush=True)
 
 
 def _prune_stage(stage: str, expected: set) -> list[str]:
@@ -1028,49 +1049,57 @@ def sync_model(conn, org, task) -> dict:
         _expect = {f["path"]: (f.get("size"), f.get("sha256"), f.get("blob_id"))
                    for f in normal}
         _download_set(conn, org, src, model, paths, stage, on_file=_on_dl, expect=_expect)
+    # 3) README 管线: init/模板 → 不同步(返回 False 且不写暂存); 有效正文 → 变换落盘
+    #    2026-10-14 修正: readme_staged 必须按**暂存里的实际文件**判断(此前按"源侧是否有
+    #    README"判断 → init README / 未落盘时仍要求目标侧有 README, 造成误判失败)
+    readme_staged = False
     if readme is not None:
-        _readme_download_and_stage(conn, org, src, dst, model, stage)
+        readme_staged = bool(_readme_download_and_stage(conn, org, src, dst, model, stage))
+        readme_staged = readme_staged and os.path.isfile(os.path.join(stage, "README.md"))
 
-    # 3.5) 上传前 prune: 只保留"期望集合"(本次 paths + README)
+    # 3.5) 上传前 prune: 只保留"期望集合"(本次 paths + **实际已落盘的** README)
     #      实测两个 SDK 都不清理 <file>.incomplete 等残留, 而 upload_folder 会全传上去
-    expected = set(paths) | ({"README.md"} if readme is not None else set())
+    expected = set(paths) | ({"README.md"} if readme_staged else set())
     pruned = _prune_stage(stage, expected)
     if pruned:
         print(f"[transfer] {model} 上传前清理暂存残留 {len(pruned)} 个: {pruned[:5]}", flush=True)
 
     # 4) 上传(一次 commit)
     uploaded_expect: dict = {}
-    readme_staged = False
     if os.listdir(stage):
         _progress(conn, task_id, f"上传 {len(paths)} 个文件 ({total_bytes / 1e9:.2f} GB, 一次 commit)")
         print(f"[sync] {model} model_sync 开始批量上传 {len(paths)} 个文件 "
               f"({total_bytes / 1e9:.2f} GB, 一次 commit) ...", flush=True)
         _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}")
-        _uploaded = set(paths) | ({"README.md"} if readme is not None else set())
+        # 注意: README.md 必须排除在"硬校验集"之外 —— 它的内容是 README 管线变换产物
+        # (源侧 sha/size 必然不符), 其可见性由 readme_staged/readme_missing 单独判定(只告警)
+        _uploaded = set(paths) | ({"README.md"} if readme_staged else set())
         uploaded_expect = {f["path"]: (f.get("size"), f.get("sha256"), f.get("blob_id"))
-                           for f in normal if f["path"] in _uploaded}
-        readme_staged = "README.md" in _uploaded
+                           for f in normal if f["path"] in _uploaded and f["path"] != "README.md"}
 
     # 4.5) 回读校验(设计 §5.2 step 6): 不过 → 抛错, 任务失败, 不写基线
     if uploaded_expect or readme_staged:
-        _bad = _verify_uploaded(org, dst, model, uploaded_expect, readme_staged=readme_staged)
+        _bad, _readme_missing = _verify_uploaded(org, dst, model, uploaded_expect,
+                                                readme_staged=readme_staged)
         if _bad:
             raise RuntimeError(f"上传后回读校验失败 {len(_bad)} 个文件(示例 {_bad[:3]}); "
                                f"基线未回写, 暂存保留待重试")
+        if _readme_missing:
+            _warn_readme_pending(conn, org, model, dst)
 
     # 5) 校验 + 6) 回写基线(含 last_synced_at 标记目标侧)
     _refresh_baselines(conn, org, model, now)
     # 模型级同步完成 = 该仓文件树此刻已同步 → 回写"已核验仓版本"(v8, 见 record_files_verified)
     record_files_verified(conn, org, model)
     synced = [p for p in paths]
-    if readme is not None:
+    if readme_staged:
         synced.append("README.md")
     _mark_synced(conn, org.id, dst, _repo_id(org, dst, model), synced, now)
     _maybe_clean_stage(task, stage, None)            # 成功 → 删暂存(2026-10-08 policy A)
     _reset_file_fail(conn, org, model)               # 成功 → 清失败退避
     _log_list(f"{model} model_sync {src}→{dst} 上传(一次 commit)", synced,
               total_bytes=sum(sizes.get(p, 0) for p in synced))
-    return {"ok": True, "uploaded": len(paths) + (1 if readme is not None else 0),
+    return {"ok": True, "uploaded": len(paths) + (1 if readme_staged else 0),
             "direction": direction}
 
 
@@ -1164,10 +1193,13 @@ def sync_files(conn, org, task) -> dict:
         _expect = {p: (r.get("size"), r.get("sha256"), r.get("blob_id"))
                    for p, r in (d.get("cur_scope") or {}).items()}
         _download_set(conn, org, "scope", model, ups, stage, on_file=_on_dl, expect=_expect)
+    # README 管线: 只有**真的落盘**才算本次要上传(2026-10-14 修正, 同 sync_model)
+    readme_staged = False
     if "README.md" in d["to_modelers"]:
-        _readme_download_and_stage(conn, org, "scope", "modelers", model, stage)
-    # 上传前 prune: 只保留"期望集合"(本次 ups + README)
-    expected = set(ups) | ({"README.md"} if "README.md" in d["to_modelers"] else set())
+        readme_staged = bool(_readme_download_and_stage(conn, org, "scope", "modelers", model, stage))
+        readme_staged = readme_staged and os.path.isfile(os.path.join(stage, "README.md"))
+    # 上传前 prune: 只保留"期望集合"(本次 ups + 已落盘的 README)
+    expected = set(ups) | ({"README.md"} if readme_staged else set())
     _pruned = _prune_stage(stage, expected)
     if _pruned:
         print(f"[transfer] {model} 上传前清理暂存残留 {len(_pruned)} 个: {_pruned[:5]}", flush=True)
@@ -1176,16 +1208,20 @@ def sync_files(conn, org, task) -> dict:
         print(f"[sync] {model} 开始批量上传 {len(ups)} 个文件 ({_total_up / 1e9:.2f} GB, 一次 commit)",
               flush=True)
         _upload_dir(org, "modelers", model, stage, f"sync v2 file_batch: {model} →modelers")
-        uploaded = ups + (["README.md"] if "README.md" in d["to_modelers"] else [])
+        uploaded = ups + (["README.md"] if readme_staged else [])
         _progress(conn, task_id, f"上传完成 {len(uploaded)} 个文件")
         # 4.5) 回读校验(设计 §5.2 step 6): 不过 → 抛错(任务失败, 不写基线)
+        # README.md 排除在硬校验集外(同 sync_model): 内容经管线变换, 只看可见性
         _exp = {p: (r.get("size"), r.get("sha256"), r.get("blob_id"))
-                for p, r in (d.get("cur_scope") or {}).items() if p in set(uploaded)}
-        _bad = _verify_uploaded(org, "modelers", model, _exp,
-                                readme_staged="README.md" in uploaded)
+                for p, r in (d.get("cur_scope") or {}).items()
+                if p in set(uploaded) and p != "README.md"}
+        _bad, _readme_missing = _verify_uploaded(org, "modelers", model, _exp,
+                                                readme_staged=readme_staged)
         if _bad:
             raise RuntimeError(f"上传后回读校验失败 {len(_bad)} 个文件(示例 {_bad[:3]}); "
                                f"基线未回写, 暂存保留待重试")
+        if _readme_missing:
+            _warn_readme_pending(conn, org, model, "modelers")
     # 2026-10-08: 成功 → 删暂存 + 复位失败退避; 失败 → 暂存保留待重试(task_runner 决定终态清理)
     _maybe_clean_stage(task, stage, None)
     _reset_file_fail(conn, org, model)

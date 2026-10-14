@@ -12,6 +12,8 @@
          scope_delete_manual/rehash_mismatch/scope_weights_missing) — 需人工到平台处理;
   留痕(readme_adopt_overwrite: 采纳期 README 分歧已按魔塔版覆盖) — 提醒, 无需人工;
   安全闸自动处置(scope_shell_rebuild: 魔塔空壳仓 → 已自动反向建塔) — 提醒, 无需人工;
+  回读校验降级(readme_verify_pending: 权重校验已过, 仅 README 暂未在目标树可见(索引延迟),
+  下一轮 README 管线自行收敛) — 提醒, 无需人工;
   任务失败(不可重试/连续失败N次/[紧急任务失败], critical, 带 task_id);
   提醒(GitCode 镜像导入 → 开启 pull 等)。
 """
