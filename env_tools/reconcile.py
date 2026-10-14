@@ -71,10 +71,20 @@ def _has_scope_rebuild(conn, org_id: str, model: str) -> bool:
 
 
 def _alert_once(conn, org_id: str, model: str, prefix: str, level: str, msg: str) -> None:
-    """同类同模型告警去重: alerts 表 error LIKE '前缀%' 已存在则不再重复。"""
+    """同类同模型告警去重(**窗口 + 可复位**, 2026-10-14 定稿)。
+
+    设计 §7 要求"同类同 model 只告警一次, 状态变化后重置"; 旧实现只查"历史上是否出现过"
+    → 问题修复后再次复发**永久静默**(暗病)。现判定改为:
+      `alert.dedup_window_d`(默认 7)天内、**且未被 `alerts --resolve` 复位**的同类告警
+    才算重复; 窗口过期或已复位 → 允许再次告警。
+    """
+    from env_tools import db as _db
+    days = int(_db.get_app_config(conn, org_id, "alert.dedup_window_d", 7) or 7)
+    since = _now() - max(days, 0) * 86400
     row = conn.execute(
-        "SELECT 1 FROM alerts WHERE org=? AND model=? AND error LIKE ? LIMIT 1",
-        (org_id, model, prefix + "%")).fetchone()
+        "SELECT 1 FROM alerts WHERE org=? AND model=? AND error LIKE ? "
+        "AND resolved_at IS NULL AND created_at>=? LIMIT 1",
+        (org_id, model, prefix + "%", since)).fetchone()
     if row is None:
         tasks.insert_alert(conn, org_id, None, model, level, f"{prefix}: {msg}")
 
@@ -125,7 +135,7 @@ def model_level(conn, org, now: int | None = None) -> dict:
             "repo_delete": 0, "adopted": 0, "skip_no_weights": 0, "skip_gated": 0,
             "gated_no_modelers": 0, "gated_hidden": 0, "gated_public": 0,
             "gated_converted": 0,
-            "dual_upload": 0, "vis_mismatch": 0, "adopted_names": [], "seen": {},
+            "vis_mismatch": 0, "adopted_names": [], "seen": {},
             "scope_shell": 0, "skip_rebuild": 0}
 
     if not org.scope.configured:
@@ -205,7 +215,10 @@ def model_level(conn, org, now: int | None = None) -> dict:
 
     # ---- 2) 魔乐独有(魔塔 list 无): 准入 + 反向新增 / 双端上传告警 ----
     for name in sorted(modelers_names - scope_names):
-        if name in db_scope:
+        # 2026-10-14 对齐设计 §2.1: 只有"魔塔端真有过权重记录"(魔塔 models 行 + 魔塔 files
+        # 权重行)才算"已知模型 → 归 step3 删除传播"。仅有 models 行而无权重基线(空壳仓/
+        # 建仓中断)一律按"魔乐独有"走反向建塔 —— 否则 step2 跳过、step3 也跳过 → 该模型卡死。
+        if name in db_scope and _db_had_weights(conn, org.id, name):
             continue
         files = _fetch_check(conn, org, "modelers", name)
         if files is None:
@@ -321,10 +334,17 @@ def _fetch_check(conn, org, platform: str, name: str):
         return None
 
 
-def _db_had_weights(conn, org_id: str, name: str) -> bool:
+def _db_had_weights(conn, org_id: str, name: str, platform: str = "scope") -> bool:
+    """该模型在**指定平台**(默认魔塔)是否曾有 `.safetensors` 记录 —— "存在过"的唯一凭据。
+
+    2026-10-14 对齐设计 §2.1("DB **魔塔行**曾有 safetensors"): 旧实现不分平台, 魔乐侧
+    记录也会被当成"曾有权重" → 对"魔塔端从未有过权重基线"的模型误判为"人工删除魔塔",
+    进而走删除传播把魔乐仓删掉。现默认只认魔塔端。
+    """
     row = conn.execute(
-        "SELECT 1 FROM files WHERE org=? AND repo_id LIKE ? AND path LIKE '%.safetensors' LIMIT 1",
-        (org_id, f"%/{name}",)).fetchone()
+        "SELECT 1 FROM files WHERE org=? AND platform=? AND repo_id LIKE ? "
+        "AND path LIKE '%.safetensors' LIMIT 1",
+        (org_id, platform, f"%/{name}")).fetchone()
     return row is not None
 
 
@@ -902,6 +922,14 @@ def _adopt_readme_check(conn, org, model: str, d: dict, stat: dict) -> None:
                 _commit(conn)
                 return
         # 需要同步/覆盖: 入队 file_batch(魔塔版 → 魔乐)
+        # 2026-10-14(用户定稿): 采纳期"双侧都是有效正文但不一致"时, 覆盖必须留痕 ——
+        # 否则覆盖后正文一致, 后续 readme_body_mismatch 永远不会触发, 等于无声改文档。
+        if ("modelers" in texts and not init["modelers"]
+                and pipeline.normalize_body(pipeline.split_front_matter(texts["modelers"])[1])
+                != pipeline.normalize_body(pipeline.split_front_matter(texts["scope"])[1])):
+            _alert_once(conn, org.id, model, "readme_adopt_overwrite", "warn",
+                        "采纳期两侧 README 均为有效正文且不一致 → 已按魔塔版覆盖魔乐(留痕; "
+                        "如需保留魔乐版请在魔塔侧修改)")
         for plat in texts:
             _set_readme_init(conn, org.id, plat, repo_ids[plat],
                              1 if plat == "modelers" and init["modelers"] else 0)

@@ -9,7 +9,8 @@
 告警类型盘点(2026-09, 供 alerts CLI 分类展示):
   审计留痕(audit_delete/audit_delete_file/audit_clear)  — 同步器操作记录, 无需处理;
   需人工(delete_manual/vis_mismatch/gated_public_on_modelers/gated_converted/
-         dual_upload/scope_delete_manual/rehash_mismatch/scope_weights_missing) — 需人工到平台处理;
+         scope_delete_manual/rehash_mismatch/scope_weights_missing) — 需人工到平台处理;
+  留痕(readme_adopt_overwrite: 采纳期 README 分歧已按魔塔版覆盖) — 提醒, 无需人工;
   安全闸自动处置(scope_shell_rebuild: 魔塔空壳仓 → 已自动反向建塔) — 提醒, 无需人工;
   任务失败(不可重试/连续失败N次/[紧急任务失败], critical, 带 task_id);
   提醒(GitCode 镜像导入 → 开启 pull 等)。
@@ -27,7 +28,7 @@ def classify_alert(error: str | None, level: str) -> str:
     if head in ("audit_delete", "audit_delete_file", "audit_clear"):
         return "审计留痕"
     if head in ("delete_manual", "vis_mismatch", "gated_public_on_modelers",
-                "gated_converted", "dual_upload", "scope_delete_manual",
+                "gated_converted", "scope_delete_manual",
                 "rehash_mismatch", "scope_weights_missing"):
         return "需人工"
     if level == "critical" or "失败" in err or "紧急" in err:

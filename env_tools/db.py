@@ -32,6 +32,11 @@ SCHEMA_VERSION 8 变更(2026-09-14, 对账调度重构): models 增加 files_ver
 单仓做; 核验成功(无差异或同步成功)才回写该值 → 失败自动保持 dirty、下轮重入队。
 首次部署 / `audit --force` 仍走全量扫描(此时该列为 NULL = 全部 dirty)。
 
+SCHEMA_VERSION 10 变更(2026-10-14):
+  - alerts 增加 `resolved_at`(告警去重改为"7 天窗口 + 未复位", 并支持 `alerts --resolve`);
+  - 删除 4 个从未读写的死列: models.license_norm/model_type/card_json + files.committer
+    (早期 SDK 探索提出的"富卡片/派生列"需求已正式放弃)。
+
 SCHEMA_VERSION 9 变更(2026-10-08, 失败退避): models 增加 files_fail_count /
 files_retry_at —— 文件级/模型级同步任务**终态失败**后给该模型指数退避(默认 30min 起,
 上限 24h), 队列生成在退避期内不再重建任务。背景: 旧逻辑"失败不写 verified_lm → 保持
@@ -46,7 +51,7 @@ import time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "sync.db")
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 TASKS_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -102,14 +107,11 @@ CREATE TABLE IF NOT EXISTS models (
   created_at    INTEGER,
   last_modified INTEGER,
   license_raw   TEXT,
-  license_norm  TEXT,
   display_name  TEXT,
   file_size     INTEGER,
   params        INTEGER,
   tasks_json    TEXT,
   tags_json     TEXT,
-  model_type    TEXT,
-  card_json     TEXT,
   first_seen_at INTEGER,
   last_seen_at  INTEGER NOT NULL,
   -- SCHEMA_VERSION 2 新增:
@@ -141,7 +143,6 @@ CREATE TABLE IF NOT EXISTS files (
   is_lfs        INTEGER,
   mode          TEXT,
   revision      TEXT,
-  committer     TEXT,
   poison        TEXT,
   missing_since INTEGER,
   last_seen_at  INTEGER NOT NULL,
@@ -186,7 +187,8 @@ CREATE TABLE IF NOT EXISTS alerts (
   model      TEXT,
   level      TEXT NOT NULL CHECK (level IN ('warn','critical')),
   error      TEXT,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER                               -- v10: alerts --resolve 复位时刻(复位后同类可再告警)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts (org, created_at);
 
@@ -250,8 +252,29 @@ def _ensure_known_columns(conn: sqlite3.Connection) -> None:
         ("files", "rehash_next_try_at", "rehash_next_try_at INTEGER"),
         ("tasks", "progress", "progress TEXT"),
         ("tasks", "started_at", "started_at INTEGER"),
+        ("alerts", "resolved_at", "resolved_at INTEGER"),
     ):
         _ensure_column(conn, table, column, ddl)
+
+
+def _drop_dead_columns(conn: sqlite3.Connection) -> None:
+    """v10(2026-10-14): 删除 4 个"从未被读写"的历史列。
+
+    判定依据: 全仓仅在建表语句出现 1 次(无任何 INSERT/SELECT/UPDATE)——
+    `models.license_norm` / `models.model_type` / `models.card_json` / `files.committer`。
+    来源是早期 SDK 探索文档提出、但从未落地的"富卡片/派生列"需求(MODELScope §5.4, 已正式放弃)。
+    SQLite 3.35+ 支持 DROP COLUMN; 列不存在则跳过(幂等)。
+    """
+    for table, col in (("models", "license_norm"), ("models", "model_type"),
+                       ("models", "card_json"), ("files", "committer")):
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+            print(f"[db] v10 删除死列 {table}.{col}")
+        except sqlite3.OperationalError as e:
+            print(f"[db] v10 删列跳过 {table}.{col}: {e}")
 
 
 def _tasks_needs_rebuild(conn: sqlite3.Connection) -> bool:
@@ -307,6 +330,9 @@ def migrate(db_path: str | None = None) -> None:
             n = _backfill_files_verified(conn)
             if n:
                 print(f"[db] v8 回填 models.files_verified_lm: {n} 行(已有文件基线视为已核验)")
+        if current < 10:
+            # v10(2026-10-14): 删 4 个死列; alerts.resolved_at 由 _ensure_known_columns 补齐
+            _drop_dead_columns(conn)
         if current < SCHEMA_VERSION:
             conn.execute("INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?,?)",
                          (SCHEMA_VERSION, int(time.time())))

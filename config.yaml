@@ -61,3 +61,5 @@ sync:
 
 alert:
   webhook_url: ${ALERT_WEBHOOK_URL}
+  dedup_window_d: 7                 # 告警去重窗口(天): 窗口内同类同模型只告警一次;
+                                    # 可用 `alerts --resolve` 提前复位, 复位后同类可再次告警

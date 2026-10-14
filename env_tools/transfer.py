@@ -4,12 +4,17 @@
 只读拉取(fetch_remote_*)在 Phase 2 已实现(真实 SDK, 礼貌限速);
 写操作(sync_model / sync_files / delete_repo_task 等)Phase 3 落地。
 
-硬约束(实现时, 见指南 §9.1):
-  - 一个上传批次 = 一次 commit(upload_folder 整体调用, 禁止 per-file upload);
-  - SDK 内部并发池 max_workers=5(3~5 文件即可打满 1G 带宽, 不做 work 级并发);
-  - 上传后 LFS sha256 回读校验通过才标记成功;
-  - 下载去掉 force_download=True(本地 sha256 匹配即跳过);
-  - 全局限速: utils/ratelimit.global_limiter(6 req/s + 抖动, 勿高并发对抗 WAF)。
+硬约束(2026-10 现状, 与代码一致):
+  - 一个上传批次 = **一次 commit**(upload_folder 整体调用, 禁止 per-file upload / 禁止分块);
+  - **任务之间严格串行, 任务内部借用平台 SDK 并发**: 下载走 `download_repo`(魔塔)/
+    `snapshot_download` 缓存模式(魔乐), 并发度 = app_config `sync.download_workers`(默认 5);
+  - **上传后回读校验**(2026-10-14 补实现): 目标侧有 64 位内容哈希(魔塔全文件/魔乐 LFS)时与源
+    sha256 强校验; 只有 40 位 blob_id(魔乐非 LFS)时校验 size+blob 存在性; README 只校验存在;
+    不过 → 任务失败且不写基线(此前只有注释没有代码 = 假安全);
+  - 下载复用: 魔塔 `download_repo(local_dir)` 按清单 sha256 校验本地文件后跳过(带 Range 续传);
+    魔乐用缓存模式 + `_materialize`(先 realpath 解到真实 blob 再硬链接 —— 缓存快照里是相对符号
+    链接, 直接 os.link 会落成断链, 2026-10-12 生产回归教训);
+  - 全局限速: utils.ratelimit.global_limiter(6 req/s + 抖动, 勿高并发对抗 WAF)。
 """
 from __future__ import annotations
 
@@ -435,6 +440,64 @@ def _validate_downloaded(dest_dir: str, paths: list[str], meta: dict,
         if src_platform == "scope" and not sha64 and blob40:
             if _git_blob_sha1(fp) != blob40:
                 bad.append(p)
+    return bad
+
+
+def _verify_uploaded(org, dst_platform: str, model: str, expect: dict,
+                     readme_staged: bool = False) -> list[str]:
+    """上传后**回读校验**(设计 §5.2 step 6; 2026-10-14 补实现)。
+
+    设计承诺"上传后回读校验通过才标记成功", 此前只有注释没有代码 → 假安全(任务"成功"
+    仅代表 SDK 没抛异常)。现按目标侧能力分档校验:
+      - 目标侧给出 64 位内容哈希(魔塔全文件 / 魔乐 LFS)→ 与源 sha256 **强校验**;
+      - 目标侧只有 40 位 blob_id(魔乐非 LFS)→ 校验 size 相等 + blob_id 存在;
+      - README.md 只校验"存在"(内容是 README 管线变换产物, 哈希必然与源不同)。
+    平台索引有秒级延迟 → 不一致时 5s 后重读, 共 3 次; 仍不一致才判失败(任务失败, 不写基线)。
+    成本: 目标侧 1~3 次 list 请求。
+    """
+    import time as _t
+    if not expect and not readme_staged:
+        return []
+    bad: list[str] = []
+    read_ok = False
+    for attempt in range(3):
+        try:
+            files = fetch_remote_files(None, org, dst_platform, model)
+            read_ok = True
+        except Exception as e:
+            print(f"[transfer] {model} 回读校验: 拉目标树失败({type(e).__name__}: {e}), 重试",
+                  flush=True)
+            _t.sleep(5)
+            continue
+        target = {f["path"]: f for f in files}
+        bad = []
+        for p, meta in expect.items():
+            t = target.get(p)
+            if t is None:
+                bad.append(p)
+                continue
+            size, sha = (meta[0] if len(meta) > 0 else None), (meta[1] if len(meta) > 1 else None)
+            if t.get("sha256"):                    # 目标侧有 64 位内容哈希 → 强校验
+                if sha and t["sha256"] != sha:
+                    bad.append(p)
+            else:                                  # 目标侧只有 40 位 blob_id → size + blob 存在性
+                if size and (t.get("size") or 0) != size:
+                    bad.append(p)
+                elif not t.get("blob_id"):
+                    bad.append(p)
+        if readme_staged and "README.md" not in target:
+            bad.append("README.md")
+        if not bad:
+            print(f"[transfer] {model} 回读校验通过: {len(expect)} 个文件"
+                  + (" + README" if readme_staged else ""), flush=True)
+            return []
+        if attempt < 2:
+            print(f"[transfer] {model} 回读校验不一致 {len(bad)} 个(示例 {bad[:3]}), "
+                  f"5s 后重试({attempt + 2}/3)", flush=True)
+            _t.sleep(5)
+    if not read_ok:
+        # 拉不到目标树 = 无法确认 → 必须失败(绝不静默放行), 由调用方按任务失败处理
+        raise RuntimeError(f"回读校验无法完成: 目标树 {dst_platform}/{model} 连续 3 次拉取失败")
     return bad
 
 
@@ -976,11 +1039,24 @@ def sync_model(conn, org, task) -> dict:
         print(f"[transfer] {model} 上传前清理暂存残留 {len(pruned)} 个: {pruned[:5]}", flush=True)
 
     # 4) 上传(一次 commit)
+    uploaded_expect: dict = {}
+    readme_staged = False
     if os.listdir(stage):
         _progress(conn, task_id, f"上传 {len(paths)} 个文件 ({total_bytes / 1e9:.2f} GB, 一次 commit)")
         print(f"[sync] {model} model_sync 开始批量上传 {len(paths)} 个文件 "
               f"({total_bytes / 1e9:.2f} GB, 一次 commit) ...", flush=True)
         _upload_dir(org, dst, model, stage, f"sync v2: {model} {src}→{dst}")
+        _uploaded = set(paths) | ({"README.md"} if readme is not None else set())
+        uploaded_expect = {f["path"]: (f.get("size"), f.get("sha256"), f.get("blob_id"))
+                           for f in normal if f["path"] in _uploaded}
+        readme_staged = "README.md" in _uploaded
+
+    # 4.5) 回读校验(设计 §5.2 step 6): 不过 → 抛错, 任务失败, 不写基线
+    if uploaded_expect or readme_staged:
+        _bad = _verify_uploaded(org, dst, model, uploaded_expect, readme_staged=readme_staged)
+        if _bad:
+            raise RuntimeError(f"上传后回读校验失败 {len(_bad)} 个文件(示例 {_bad[:3]}); "
+                               f"基线未回写, 暂存保留待重试")
 
     # 5) 校验 + 6) 回写基线(含 last_synced_at 标记目标侧)
     _refresh_baselines(conn, org, model, now)
@@ -1102,6 +1178,14 @@ def sync_files(conn, org, task) -> dict:
         _upload_dir(org, "modelers", model, stage, f"sync v2 file_batch: {model} →modelers")
         uploaded = ups + (["README.md"] if "README.md" in d["to_modelers"] else [])
         _progress(conn, task_id, f"上传完成 {len(uploaded)} 个文件")
+        # 4.5) 回读校验(设计 §5.2 step 6): 不过 → 抛错(任务失败, 不写基线)
+        _exp = {p: (r.get("size"), r.get("sha256"), r.get("blob_id"))
+                for p, r in (d.get("cur_scope") or {}).items() if p in set(uploaded)}
+        _bad = _verify_uploaded(org, "modelers", model, _exp,
+                                readme_staged="README.md" in uploaded)
+        if _bad:
+            raise RuntimeError(f"上传后回读校验失败 {len(_bad)} 个文件(示例 {_bad[:3]}); "
+                               f"基线未回写, 暂存保留待重试")
     # 2026-10-08: 成功 → 删暂存 + 复位失败退避; 失败 → 暂存保留待重试(task_runner 决定终态清理)
     _maybe_clean_stage(task, stage, None)
     _reset_file_fail(conn, org, model)

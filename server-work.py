@@ -412,6 +412,8 @@ def cmd_alerts(args) -> int:
     from env_tools import alerts as alert_mod
 
     raw_cfg, orgs, conn = _init_for_output(args)
+    if args.resolve:
+        return _resolve_alerts(args, conn)
     since_h = args.since if args.since is not None else 24
     limit = args.limit if args.limit is not None else 20
     rows = alert_mod.list_alerts(conn, org=args.org, level=args.level,
@@ -435,9 +437,50 @@ def cmd_alerts(args) -> int:
     for r in rows:
         tag = alert_mod.classify_alert(r["error"], r["level"])
         ts = time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))
-        print(f"  #{r['id']} [{ts}] {r['level']:>8} [{tag}] org={r['org']} "
+        mark = " [已复位]" if ("resolved_at" in r.keys() and r["resolved_at"]) else ""
+        print(f"  #{r['id']} [{ts}] {r['level']:>8} [{tag}]{mark} org={r['org']} "
               f"model={r['model'] or '-'} task={r['task_id'] or '-'}")
         print(f"      {(r['error'] or '')[:150]}")
+    return 0
+
+
+def _resolve_alerts(args, conn) -> int:
+    """`alerts --resolve`: 把匹配的未复位告警标记 resolved_at(去重窗口立即失效)。
+
+    - 过滤: --org / --model / --level / --prefix(类型前缀) / --id, 至少给一个;
+    - 默认 dry-run 只列清单, `--yes` 才落库(与 clean/retry 一致);
+    - 语义: 不删历史(留痕保留), 只影响"同类是否算重复"的判定 → 复位后同类可再告警。
+    """
+    if not any((args.org, args.model, args.level, args.prefix, args.id)):
+        print("[alerts] --resolve 需要至少一个过滤条件(--org/--model/--level/--prefix/--id), "
+              "避免误复位全部告警")
+        return 2
+    q = "SELECT id, org, model, level, error FROM alerts WHERE resolved_at IS NULL"
+    params: list = []
+    if args.org:
+        q += " AND org=?"; params.append(args.org)
+    if args.model:
+        q += " AND model=?"; params.append(args.model)
+    if args.level:
+        q += " AND level=?"; params.append(args.level)
+    if args.prefix:
+        q += " AND error LIKE ?"; params.append(args.prefix + "%")
+    if args.id:
+        q += " AND id=?"; params.append(args.id)
+    q += " ORDER BY id"
+    rows = conn.execute(q, params).fetchall()
+    print(f"[alerts] 待复位 {len(rows)} 条" + ("" if args.yes else "  (dry-run; 加 --yes 执行)"))
+    for r in rows[:50]:
+        print(f"  #{r['id']} [{r['level']}] org={r['org']} model={r['model'] or '-'} "
+              f"{(r['error'] or '')[:90]}")
+    if len(rows) > 50:
+        print(f"  ... 其余 {len(rows) - 50} 条略")
+    if args.yes and rows:
+        with conn:
+            conn.execute(
+                f"UPDATE alerts SET resolved_at=? WHERE id IN ({','.join('?' * len(rows))})",
+                [int(time.time())] + [r["id"] for r in rows])
+        print(f"[alerts] 已复位 {len(rows)} 条(同类告警可再次触发)")
     return 0
 
 
@@ -684,6 +727,12 @@ def main() -> int:
                     help="alerts: 只看 warn/critical")
     ap.add_argument("--since", type=int, default=None,
                     help="alerts: 最近 N 小时(默认 24)")
+    ap.add_argument("--resolve", action="store_true",
+                    help="alerts: 复位匹配告警(标记 resolved_at → 同类告警可再次触发; "
+                         "默认 dry-run, 加 --yes 执行)")
+    ap.add_argument("--prefix", default=None,
+                    help="alerts: 按类型前缀过滤(如 vis_mismatch/delete_manual)")
+    ap.add_argument("--id", type=int, default=None, help="alerts --resolve: 单条告警 id")
     ap.add_argument("--task-id", type=int, default=None, help="cancel: 任务 id")
     ap.add_argument("--force", action="store_true",
                     help="audit: 忽略 15min 对账节流强制执行(默认受节流; 仅 audit 使用)")

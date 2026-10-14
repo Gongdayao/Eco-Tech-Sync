@@ -6,6 +6,11 @@
 
 > 同步方向与历史: 早期"双向对称同步"方案因魔塔 API 不支持删除而封存(设计文档见 §14)。
 > 当前为 **2026-09 定稿的单向方案**: 模型级新增双向、删除以魔塔为主;文件级魔塔为准严格镜像。
+>
+> **配套设计文档(项目根)**: `V2-DESIGN.md`(总体设计, §10 为政策级变更记录 ADR) /
+> `V2-IMPLEMENTATION-GUIDE.md`(实现与验收) / `V2-SQLITE-DESIGN.md`(DB 设计) /
+> `V2-MODELSCOPE-SDK-EXPLORE.md`、`V2-MODELERS-SDK-EXPLORE.md`(平台 SDK 实测)。
+> 代码改动涉及规则/政策时, 必须同步更新上述文档(2026-10-14 起纪律)。
 
 ---
 
@@ -95,7 +100,8 @@ ALERT_WEBHOOK_URL=""                             # 告警 webhook(可选)
   2026-10-08 新增:`sync.download_workers`(任务内下载并发)、`sync.stage_stale_days`(暂存清理天数, 默认 7)、
   `sync.cache_stale_days`(SDK 缓存清理天数, 默认 30)、`sync.file_retry_backoff_min` /
   `sync.file_retry_backoff_cap_h`(同步任务终态失败后的指数退避, 默认 30min 起 / 24h 上限);
-  `alert.webhook_url`(告警 webhook, 见 §5.11)。
+  `alert.webhook_url`(告警 webhook, 见 §5.11)、`alert.dedup_window_d`(告警去重窗口, 默认 7 天,
+  配合 `alerts --resolve` 复位)。
 - ⚠ 种子化是 `INSERT OR IGNORE`:改 config.yaml 不影响**已存在**的 DB,需改 `app_config` 或删库重建。
 
 ## 5. 操作方法(全量)
@@ -243,7 +249,15 @@ python server-work.py alerts --org Eco-Tech         # 按组织
 python server-work.py alerts --since 168            # 最近 168 小时
 python server-work.py alerts --limit 50             # 条数上限
 python server-work.py alerts --json                 # JSON 输出(脚本/监控)
+python server-work.py alerts --prefix vis_mismatch   # 按告警类型前缀过滤
+
+# 复位(2026-10-14): 标记 resolved_at → 同类告警可再次触发(不删历史, 只影响去重判定)
+python server-work.py alerts --resolve --model X --prefix vis_mismatch        # dry-run 先看清单
+python server-work.py alerts --resolve --org Eco-Tech --level critical --yes  # 确认后执行
 ```
+> 去重语义(2026-10-14): 同类同 model 在 `alert.dedup_window_d`(默认 7)天内只告警一次;
+> **窗口过期或调用 `--resolve` 复位后, 同类问题再次出现会重新告警** —— 修掉旧实现
+> "问题修复后复发永久静默"的暗病。`--resolve` 必须给至少一个过滤条件(防误复位)。
 
 输出示例(每条含分类标签):
 
@@ -262,9 +276,9 @@ python server-work.py alerts --json                 # JSON 输出(脚本/监控)
 | 标签 | 类型(告警前缀/特征) | 处理 |
 |---|---|---|
 | 审计留痕 | `audit_delete` / `audit_delete_file` / `audit_clear` | 同步器操作记录,无需处理 |
-| 需人工 | `delete_manual` / `vis_mismatch` / `gated_public_on_modelers`(critical) / `gated_converted` / `dual_upload` / `scope_delete_manual` / `rehash_mismatch` / `rehash_download_failed`(强哈希连续 3 次下载失败, 已按指数退避继续重试) | 需到平台人工处理(删除/可见性/gated; `rehash_download_failed` 多为文件不可下载, 确认后可忽略) |
+| 需人工 | `delete_manual` / `vis_mismatch` / `gated_public_on_modelers`(critical) / `gated_converted` / `scope_delete_manual` / `scope_weights_missing`(critical, 魔塔 0 权重已禁删) / `rehash_mismatch` / `rehash_download_failed`(强哈希连续 3 次下载失败, 已按指数退避继续重试) | 需到平台人工处理(删除/可见性/gated/权威集完整性; `rehash_download_failed` 多为文件不可下载, 确认后可忽略) |
 | 任务失败 | critical: 不可重试失败 / 连续失败 N 次 / [紧急任务失败] | 带 task_id,配合 `status --status failed` 反查 |
-| 提醒 | GitCode 镜像导入 → 开启 pull;`content_mismatch`(跨端同名不一致, 已自动以魔塔版覆盖);`readme_body_mismatch`(README 正文不一致, 已自动以魔塔版覆盖) | 知悉即可(会自动收敛) |
+| 提醒 | GitCode 镜像导入 → 开启 pull(仅导入时一次);`content_mismatch`(跨端同名不一致, 已自动以魔塔版覆盖);`readme_body_mismatch`(README 正文不一致, 已自动以魔塔版覆盖);`readme_adopt_overwrite`(采纳期 README 分歧已按魔塔版覆盖);`scope_shell_rebuild`(魔塔空壳仓已自动反向建塔);`file_sync_backoff`(同步任务连续失败已降频重试) | 知悉即可(会自动收敛) |
 
 task_id 列可与 `python server-work.py status --status failed`(或直接查 tasks 表)联动定位具体任务。
 
@@ -367,6 +381,9 @@ python server-work.py clean --org Eco-Tech --model X --yes      # 执行删除(�
 | 复用/暂存(2026-10-08) | `下载完成(复用跳过)` / `暂存保留待重试(第 N/M 次)` / `上传前清理暂存残留 N 个` / `陈旧清理: …` |
 | 失败退避(2026-10-08) | 任务终态失败 → `[tasks] X 同步任务终态失败, 连续 N 次 → 退避 M 分钟后再试`; 第 3 次起写 `file_sync_backoff` 告警 |
 | 告警推送(2026-10-08 接线) | 所有告警经 `tasks.insert_alert` 落库; 配了 `ALERT_WEBHOOK_URL` 且**不属于"审计留痕"**(`audit_*`)时同步 POST 一次(超时 10s, 失败只降级为已落库)。此前 `dispatch_webhook` 无人调用, 配了也不会推 |
+| 回读校验(2026-10-14) | 上传后拉目标树核对: `回读校验通过: N 个文件` / `回读校验不一致 N 个 … 5s 后重试`; 最终不一致或目标树拉不到 → **任务失败**(不写基线) |
+| 安全闸(2026-10-13) | `__ 安全闸: 魔塔无任何 .safetensors 而魔乐有 N 个 → 拒绝删除 M 个文件(防残缺镜像)` + `scope_weights_missing` critical 告警; 空壳仓 → `已按魔乐独有反向建塔` |
+| 告警复位(2026-10-14) | `alerts --resolve` 打印 `待复位 N 条` / `已复位 N 条(同类告警可再次触发)`; 列表里已复位的条目带 `[已复位]` 标记 |
 | 备份/临时命名(2026-10-08) | 拉取阶段忽略 `.bak/.old/.sql/.swp/.tmp` 类命名(打印 `忽略 备份/临时命名 N 个`), 与隐藏文件同策略: **不比对/不同步/不删除** —— 天翼云 WAF 按路径模式拦这类下载(2026-09 曾让 531GB 反向同步 403 失败); 口径只含实测被拦的后缀, `.orig/.log/.zip` 等不误伤 |
 | stdout / stderr 约定 | stdout = 命令结果(JSON 模式为纯 JSON);stderr = 诊断(日志目录提示、配置警告、SDK 告警), 便于管道处理 |
 
@@ -410,6 +427,7 @@ python server-work.py retry --org Eco-Tech --yes              # 真正重建 + �
 |---|---|---|
 | **暂存不再每次清空** | 任务**成功才删**暂存; 失败保留, 下次重试由 SDK 校验后**跳过已下好的文件**、半截文件**断点续传**; **终态失败**(不可重试/次数用尽)才删 | 魔塔 `download_repo` 按清单 sha256 校验本地文件, 命中即跳过(断网也能走完); `<file>.incomplete` 带 `Range: bytes=<已下>-` 续传(实测); 魔乐 `local_dir` 模式不复用, 故改用**缓存模式**快照+硬链接(实测缓存可离线命中) |
 | **下载后自查 + 上传前 prune** | 下载完按 `size`(+必要时 blob sha1)逐文件自查, 不合格→逐文件兜底, 仍不合格→**任务失败**(绝不静默上传); 上传前把暂存归约成"本次期望集合", 清掉 `<file>.incomplete`/历史残留 | 魔塔 SDK 对单文件失败**只 warning 不抛错**(源码+实测); SDK 都不会清理残留文件, 而 `upload_folder` 会把目录里全部文件传上去 |
+| **上传后回读校验**(2026-10-14 补实现) | 上传后拉目标侧文件树核对: 目标侧有 64 位内容哈希(魔塔全文件/魔乐 LFS)→ 与源 `sha256` 强校验; 只有 40 位 `blob_id`(魔乐非 LFS)→ `size` + blob 存在性; README 只校验存在。索引延迟 5s×3 次重试, **仍不一致或拉不到目标树 → 任务失败, 不写基线** | 设计 §5.2-6 原先只有注释没有代码(假安全); 现在"成功"= 目标侧内容已核对 |
 | **终态失败指数退避** | 任务终态失败 → 该模型 `files_retry_at` 退避(30min → 1h → 2h … 上限 24h), 退避期内队列生成**不再重建任务**; 同步成功自动清零; 第 3 次失败写告警 | 旧逻辑"失败保持 dirty → 每轮重建任务"会把大任务无限重试, 烧带宽且长期留残缺镜像 |
 
 ## 7. 任务与状态机
@@ -431,7 +449,8 @@ python server-work.py retry --org Eco-Tech --yes              # 真正重建 + �
 
 ## 8. 本地 DB
 
-- `sync.db`(首次自动创建,WAL;当前 **SCHEMA_VERSION 9**):`models/files/tasks/alerts/app_config/license_map/heartbeat`;
+- `sync.db`(首次自动创建,WAL;当前 **SCHEMA_VERSION 10**):`models/files/tasks/alerts/app_config/license_map/heartbeat`;
+  v10 新增 `alerts.resolved_at`(告警复位)并删除 4 个从未读写的死列(`models.license_norm`/`model_type`/`card_json`、`files.committer`);
 - 关键列:`tasks.progress/started_at`(执行进度/领取时刻)、`files.blob_id`(魔乐非 LFS 变更指纹)、
   `files.rehash_checked_at`(强哈希周期内已核验标记)、`files.rehash_fail_count`/
   `files.rehash_next_try_at`(强哈希失败计数与下次重试时间, 指数退避)、`files.sha256_source`(`api`/`local`/`none`)、
@@ -615,7 +634,10 @@ python server-work.py clean --org <ORG> --model X --yes      # 执行(一次 com
 | `vis_mismatch` | 魔乐可见性与魔塔不一致(魔乐 API 不可改) | 到魔乐后台改 |
 | `gated_public_on_modelers`(critical) | 审批权重在魔乐公开可见 | 立即删除/隐藏该魔乐镜像 |
 | `gated_converted` | 魔塔权限 私有→申请制 | 知悉即可 |
-| `dual_upload` | 魔乐独有权重但魔塔 `repo_exists=True` | 人工判断保留哪端 |
+| `scope_shell_rebuild` | 魔塔空壳/隐身仓(不在魔塔 list) | 已自动反向建塔, 知悉即可 |
+| `scope_weights_missing` | 魔塔当前文件集 0 个 `.safetensors` 而魔乐有 | **已拒绝删除**(防残缺镜像); 人工确认魔塔侧(补全或删仓) |
+| `readme_adopt_overwrite` | 采纳期两侧 README 均为有效正文且不一致 | 已按魔塔版覆盖; 如需保留魔乐版请在魔塔侧修改 |
+| `file_sync_backoff` | 同步任务连续失败 3 次 | 已按指数退避降频重试, 检查平台端错误 |
 | `scope_delete_manual` | 魔塔 repo 已删, 同步器将删魔乐/GitCode | 知悉;若误删可先 `cancel` |
 | `content_mismatch` | 跨端同名内容不一致 | **已自动以魔塔版覆盖**, 知悉即可 |
 | `rehash_mismatch` | 强哈希复核不一致 | 排查魔乐文件是否被外部改动/平台异常 |
@@ -658,7 +680,13 @@ sqlite3 sync.db "UPDATE app_config SET value='false' WHERE org='<ORG>' AND key='
 | `sync.forced_rehash_interval_d` | 30 | 强哈希复核周期(天) |
 | `sync.forced_rehash_batch` | 800 | 强哈希每轮处理上限(首次全量分多轮) |
 | `sync.delete_grace_cycles` | 3 | **仅模型级** repo 删除宽限轮数 |
+| `sync.download_workers` | 5 | **任务内**下载并发(任务之间仍严格串行) |
+| `sync.stage_stale_days` | 7 | 暂存目录超过 N 天未改动 → 清 |
+| `sync.cache_stale_days` | 30 | SDK 缓存超过 N 天未改动 → 清(缓存可再生) |
+| `sync.file_retry_backoff_min` | 30 | 同步任务终态失败后的退避起点(分钟) |
+| `sync.file_retry_backoff_cap_h` | 24 | 退避上限(小时) |
 | `alert.webhook_url` | 空 | 告警 webhook(不配则只落库) |
+| `alert.dedup_window_d` | 7 | 告警去重窗口(天); `alerts --resolve` 可提前复位 |
 
 > 注意:`config.yaml` 的种子化是 `INSERT OR IGNORE`——改 yaml 只对**新库**生效,
 > 已存在的库要按上面的 SQL 改 `app_config`。
