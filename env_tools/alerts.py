@@ -38,8 +38,13 @@ def classify_alert(error: str | None, level: str) -> str:
 
 def list_alerts(conn: sqlite3.Connection, org: str | None = None,
                 level: str | None = None, since_h: int = 24,
-                limit: int = 20) -> list[sqlite3.Row]:
-    """查询 alerts(倒序): --org/--level/--since 过滤, limit 截断。"""
+                limit: int = 20, model: str | None = None,
+                unresolved: bool = False, all_time: bool = False) -> list[sqlite3.Row]:
+    """查询 alerts(倒序)。
+
+    过滤(2026-10-14 扩展): --org / --level / --since(小时) / --model(模糊) /
+    --unresolved(只看未复位) / all_time=True(不限时间, 对应 CLI `--all`)。
+    """
     sql = "SELECT * FROM alerts WHERE 1=1"
     args: list = []
     if org:
@@ -48,7 +53,12 @@ def list_alerts(conn: sqlite3.Connection, org: str | None = None,
     if level:
         sql += " AND level=?"
         args.append(level)
-    if since_h and since_h > 0:
+    if model:
+        sql += " AND model LIKE ?"
+        args.append(f"%{model}%")
+    if unresolved:
+        sql += " AND resolved_at IS NULL"
+    if not all_time and since_h and since_h > 0:
         sql += " AND created_at>=?"
         args.append(int(time.time()) - int(since_h) * 3600)
     sql += " ORDER BY id DESC LIMIT ?"

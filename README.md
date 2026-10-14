@@ -36,7 +36,7 @@
 
 ```
 Eco-Tech-Sync-V2/
-├── server-work.py           # 顶层入口: daemon/once/enqueue/status/alerts/cancel/audit/clean/retry
+├── server-work.py           # 顶层入口: daemon/once/enqueue/status/alerts/cancel/audit/clean/retry/task
 ├── config.yaml              # 多组织配置(${VAR} 注入, 密钥在 .env)
 ├── .env                     # 密钥(勿提交/外传)
 ├── requirements.txt         # 锁定依赖
@@ -117,7 +117,7 @@ cd <项目根>
 
 | 参数 | 说明 |
 |---|---|
-| `mode` | `daemon` / `once` / `enqueue` / `status` / `alerts` / `cancel` / `audit` / `clean` / `retry`(缺省 = daemon) |
+| `mode` | `daemon` / `once` / `enqueue` / `status` / `alerts` / `cancel` / `audit` / `clean` / `retry` / `task`(缺省 = daemon) |
 | `--config PATH` | 指定 config.yaml(默认项目根 config.yaml) |
 | `--org ID` | 组织过滤(默认全部组织) |
 | `--force` | `audit`:忽略 15min 对账节流强制执行(默认受节流; daemon 不适用) |
@@ -250,6 +250,9 @@ python server-work.py alerts --since 168            # 最近 168 小时
 python server-work.py alerts --limit 50             # 条数上限
 python server-work.py alerts --json                 # JSON 输出(脚本/监控)
 python server-work.py alerts --prefix vis_mismatch   # 按告警类型前缀过滤
+python server-work.py alerts --model X               # 按模型过滤(模糊匹配)
+python server-work.py alerts --unresolved --all      # 只看未复位 + 不限时间
+python server-work.py alerts --watch 5               # 看板: 每 5 秒刷新(Ctrl+C 退出)
 
 # 复位(2026-10-14): 标记 resolved_at → 同类告警可再次触发(不删历史, 只影响去重判定)
 python server-work.py alerts --resolve --model X --prefix vis_mismatch        # dry-run 先看清单
@@ -351,6 +354,11 @@ python server-work.py daemon           # 前台常驻(调试); Ctrl-C = 优雅�
 | 查看任务详情/错误 | `status --status failed`(看 last_error) |
 | 清理魔乐独有旧文件 | `clean --org O --model X`(dry-run)→ 加 `--yes` 执行 |
 | 批量重启失败任务 | `retry`(dry-run 列表)→ `retry --yes` 重建 + 清退避;可 `--org/--kind/--model/--limit` 过滤 |
+| 看某模型的任务历史 | `task ls --model X`(加 `--status failed` 等过滤;`--json` 给脚本) |
+| 看单条任务全貌 | `task show <id>`(全字段 + 关联告警 + 该模型退避状态与建议命令) |
+| 立即重试单条任务 | `task requeue <id>`(按原 dedup 键重建 + 清该模型退避, 绕过退避限制) |
+| 清理任务历史 | `task rm <id> --yes`;或 `task rm --status obsolete --older-than 7 --yes` |
+| 盯告警 | `alerts --unresolved --all --watch 5`(只看未复位, 不限时间, 5s 刷新) |
 
 ### 5.10 clean — 清理魔乐独有文件(人工确认/兜底)
 
@@ -402,6 +410,25 @@ python server-work.py retry --org Eco-Tech --yes              # 真正重建 + �
   `files_fail_count/files_retry_at` 清零 → **自动对账也一并恢复**;
 - 默认 dry-run, `--yes` 才落库(与 `clean` 一致);
 - ⚠ 不指定 `--kind` 时也会重建 `repo_delete`(重新尝试删除魔乐仓);只想动文件级就加 `--kind file_batch`。
+
+### 5.13 task — 任务管理(ls / show / requeue / rm)
+
+```bash
+python server-work.py task ls                                  # 最近 50 条任务(倒序)
+python server-work.py task ls --model gemma --status failed     # 按模型(模糊)/状态过滤
+python server-work.py task ls --status failed --json            # 脚本消费
+python server-work.py task show 12                              # 单条全字段 + 关联告警 + 退避状态
+python server-work.py task requeue 12                           # 立即重建(绕过退避) + 清该模型退避
+python server-work.py task rm 12                                # dry-run 列清单
+python server-work.py task rm --status obsolete --older-than 7 --yes   # 清理 7 天前的终态行
+```
+- 相比 `status`: `task ls` 不截断错误/进度(但完整字段仍看 `task show`), 支持按 `--model/--status/--kind` 过滤;
+- `task show <id>` 会把 tasks 行全字段、该任务的关联告警、以及该模型的失败退避状态一起打印,
+  并在失败时给出建议命令(`task requeue <id>` / `enqueue ...`);
+- `task requeue <id>`: 按该任务原来的 dedup 键重建为 pending(与手动 `enqueue` 同级、**不受退避限制**),
+  同时把该模型的 `files_fail_count/files_retry_at` 清零;非终态任务会直接提示"无需重建";
+- `task rm`: **默认 dry-run**, `--yes` 才删; **非终态行(pending/claimed/running)一律拒绝删除**
+  (先 `cancel --task-id N`);支持 `<id>` 单条或 `--org/--model/--status/--kind/--older-than N` 批量。
 
 ## 6. 同步规则速览
 

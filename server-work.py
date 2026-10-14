@@ -405,8 +405,11 @@ def cmd_enqueue(args) -> int:
 
 
 def cmd_alerts(args) -> int:
-    """查看告警(默认最近 24h, 倒序); --org/--level/--since/--limit/--json。
+    """查看告警(默认最近 24h, 倒序)。
 
+    过滤(2026-10-14 扩展): --org / --level / --model(模糊) / --since N(小时) / --all(不限时间) /
+    --unresolved(只看未复位) / --prefix(类型前缀) / --limit / --json / --watch N(看板, Ctrl+C 退出);
+    `--resolve` 复位匹配告警(见 _resolve_alerts)。
     分类标签: 审计留痕 / 需人工 / 任务失败 / 提醒(见 env_tools.alerts.classify_alert)。
     """
     from env_tools import alerts as alert_mod
@@ -416,32 +419,218 @@ def cmd_alerts(args) -> int:
         return _resolve_alerts(args, conn)
     since_h = args.since if args.since is not None else 24
     limit = args.limit if args.limit is not None else 20
-    rows = alert_mod.list_alerts(conn, org=args.org, level=args.level,
-                                 since_h=since_h, limit=limit)
 
-    if args.json:
-        out = {"since_h": since_h,
-               "alerts": [dict(r) for r in rows]}
-        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+    def render() -> int:
+        rows = alert_mod.list_alerts(conn, org=args.org, level=args.level, since_h=since_h,
+                                     limit=limit, model=args.model,
+                                     unresolved=args.unresolved, all_time=args.all)
+        if args.json:
+            print(json.dumps({"since_h": None if args.all else since_h,
+                              "alerts": [dict(r) for r in rows]},
+                             ensure_ascii=False, indent=2, default=str))
+            return 0
+        cq, ca = "SELECT level, COUNT(*) n FROM alerts WHERE 1=1", []   # 末尾统一 GROUP BY
+        if args.org:
+            cq += " AND org=?"; ca.append(args.org)
+        if args.model:
+            cq += " AND model LIKE ?"; ca.append(f"%{args.model}%")
+        if args.level:
+            cq += " AND level=?"; ca.append(args.level)
+        if args.unresolved:
+            cq += " AND resolved_at IS NULL"
+        if not args.all:
+            cq += " AND created_at>=?"; ca.append(int(time.time()) - since_h * 3600)
+        cnt = conn.execute(cq + " GROUP BY level", ca).fetchall()
+        summary = " ".join(f"{r['level']}={r['n']}" for r in cnt) or "(无)"
+        filt = []
+        if args.org: filt.append(f"org={args.org}")
+        if args.model: filt.append(f"model~{args.model}")
+        if args.level: filt.append(f"level={args.level}")
+        if args.unresolved: filt.append("未复位")
+        head = f"告警({'全部时间' if args.all else f'最近{since_h}h'}"
+        head += (", " + ", ".join(filt)) if filt else ""
+        head += f"): {summary} | 显示 {len(rows)} 条"
+        if args.watch:
+            head += f" | {time.strftime('%H:%M:%S')}"
+        print(head, flush=True)
+        for r in rows:
+            tag = alert_mod.classify_alert(r["error"], r["level"])
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))
+            mark = " [已复位]" if r["resolved_at"] else ""
+            print(f"  #{r['id']} [{ts}] {r['level']:>8} [{tag}]{mark} org={r['org']} "
+                  f"model={r['model'] or '-'} task={r['task_id'] or '-'}", flush=True)
+            print(f"      {(r['error'] or '')[:150]}", flush=True)
         return 0
 
-    since = int(time.time()) - since_h * 3600
-    counts = conn.execute(
-        "SELECT level, COUNT(*) n FROM alerts WHERE created_at>=? "
-        "AND (? IS NULL OR org=?) GROUP BY level",
-        (since, args.org, args.org)).fetchall()
-    summary = " ".join(f"{r['level']}={r['n']}" for r in counts) or "(无)"
-    print(f"告警(最近{since_h}h, org={args.org or '全部'}): {summary} | 显示 {len(rows)} 条")
-    if not rows:
+    if not args.watch:
+        return render()
+    try:
+        while True:
+            render()
+            print("-" * 60, flush=True)
+            time.sleep(max(1, int(args.watch)))
+    except KeyboardInterrupt:
+        print()
         return 0
-    for r in rows:
-        tag = alert_mod.classify_alert(r["error"], r["level"])
-        ts = time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))
-        mark = " [已复位]" if ("resolved_at" in r.keys() and r["resolved_at"]) else ""
-        print(f"  #{r['id']} [{ts}] {r['level']:>8} [{tag}]{mark} org={r['org']} "
-              f"model={r['model'] or '-'} task={r['task_id'] or '-'}")
-        print(f"      {(r['error'] or '')[:150]}")
-    return 0
+
+
+def cmd_task(args) -> int:
+    """任务管理(2026-10-14 新增): ls / show / requeue / rm。
+
+    ```bash
+    python server-work.py task ls [--org O] [--model M] [--status S] [--kind K] [--limit N] [--json]
+    python server-work.py task show 12          # 全字段 + 关联告警 + 该模型失败退避状态与建议
+    python server-work.py task requeue 12       # 按该任务的 dedup 键重建为 pending(绕过退避)+清退避
+    python server-work.py task rm 12            # 删终态任务行(dry-run, 加 --yes)
+    python server-work.py task rm --status obsolete --older-than 7 --yes
+    ```
+    安全习惯: `requeue <id>` 是明确指定单条 id 的即时操作(与 `enqueue` 同级, 直接执行);
+    `rm` 是破坏性操作 → 默认 dry-run 只列清单, `--yes` 才删; **非终态行(pending/claimed/running)
+    一律拒绝删除**(先 `cancel --task-id N`)。
+    """
+    from env_tools import tasks as _tasks
+
+    raw_cfg, orgs, conn = _init(args.config)
+    rest = [str(x) for x in (getattr(args, "rest", None) or [])]
+    action = (rest[0].lower() if rest else "ls")
+    arg1 = rest[1] if len(rest) > 1 else None
+
+    if action in ("ls", "list"):
+        q, params = "SELECT * FROM tasks WHERE 1=1", []
+        if args.org:
+            q += " AND org=?"; params.append(args.org)
+        if args.model:
+            q += " AND model LIKE ?"; params.append(f"%{args.model}%")
+        if args.status:
+            q += " AND status=?"; params.append(args.status)
+        if args.kind:
+            q += " AND kind=?"; params.append(args.kind)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(args.limit or 50)
+        rows = conn.execute(q, params).fetchall()
+        if args.json:
+            print(json.dumps({"count": len(rows), "tasks": [dict(r) for r in rows]},
+                             ensure_ascii=False, indent=2, default=str))
+            return 0
+        print(f"[task] 匹配 {len(rows)} 行(倒序; 完整错误/进度见 task show <id>)")
+        for r in rows:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))
+            nr = (f" next_retry={time.strftime('%m-%d %H:%M', time.localtime(r['next_retry_at']))}"
+                  if r["next_retry_at"] else "")
+            print(f"  #{r['id']:>5} [{r['status']:>11}] prio={r['priority']:>3} "
+                  f"{r['kind']:>14} {r['org']}/{r['model']} dir={r['direction'] or '-'} "
+                  f"try={r['attempts']}/{r['max_attempts']} {ts}{nr}")
+            if r["progress"]:
+                print(f"        进度: {r['progress'][:110]}")
+            if r["last_error"]:
+                print(f"        错误: {r['last_error'][:150]}")
+        return 0
+
+    if action == "show":
+        tid = int(arg1 or args.task_id or 0)
+        if not tid:
+            print("[task] show 需要任务 id: task show <id>")
+            return 2
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            print(f"[task] 任务 #{tid} 不存在")
+            return 2
+        print(f"[task] #{tid} 全字段:")
+        for k in row.keys():
+            v = row[k]
+            if k in ("created_at", "started_at", "finished_at", "next_retry_at") and v:
+                v = f"{v} ({time.strftime('%m-%d %H:%M:%S', time.localtime(v))})"
+            if k == "last_error" and v:
+                v = str(v)
+            print(f"    {k:>18} = {v}")
+        als = conn.execute("SELECT id, level, error, created_at, resolved_at FROM alerts "
+                           "WHERE task_id=? ORDER BY id", (tid,)).fetchall()
+        print(f"[task] 关联告警 {len(als)} 条:")
+        for a in als:
+            mark = " [已复位]" if a["resolved_at"] else ""
+            print(f"    #{a['id']} [{a['level']}]{mark} {time.strftime('%m-%d %H:%M', time.localtime(a['created_at']))} "
+                  f"{(a['error'] or '')[:120]}")
+        bo = conn.execute("SELECT platform, files_fail_count, files_retry_at FROM models "
+                          "WHERE org=? AND name=?", (row["org"], row["model"])).fetchall()
+        stuck = [b for b in bo if b["files_retry_at"]]
+        if stuck:
+            n = max(b["files_fail_count"] or 0 for b in stuck)
+            t = max(b["files_retry_at"] for b in stuck)
+            print(f"[task] ⚠ 该模型处于失败退避中(连续 {n} 次, 至 "
+                  f"{time.strftime('%m-%d %H:%M', time.localtime(t))}); 立即重试: "
+                  f"`task requeue {tid}` 或 `enqueue --org {row['org']} --model {row['model']} "
+                  f"--kind {row['kind']}`")
+        if row["status"] == "failed":
+            print(f"[task] 立即重建: task requeue {tid};  清理该行: task rm {tid} --yes")
+        return 0
+
+    if action in ("requeue", "retry", "restart"):
+        tid = int(arg1 or args.task_id or 0)
+        if not tid:
+            print("[task] requeue 需要任务 id: task requeue <id>")
+            return 2
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            print(f"[task] 任务 #{tid} 不存在")
+            return 2
+        if row["status"] not in _tasks.TERMINAL:
+            print(f"[task] #{tid} 当前 {row['status']} 非终态, 无需重建(同 dedup 键任务仍在)")
+            return 0
+        tid2, created = _tasks.enqueue_task(conn, row["org"], row["kind"], row["model"],
+                                           direction=row["direction"], file=row["file"],
+                                           priority=row["priority"], created_by="task_requeue")
+        conn.execute("UPDATE models SET files_fail_count=0, files_retry_at=NULL "
+                     "WHERE org=? AND name=?", (row["org"], row["model"]))
+        conn.commit()
+        print(f"[task] #{tid}({row['status']}) → 重建 #{tid2}(新建={created}); "
+              f"该模型失败退避已清零; daemon 在跑会立刻领取")
+        return 0
+
+    if action in ("rm", "del", "delete"):
+        if arg1:
+            ids = [int(arg1)]
+        else:
+            if not any((args.org, args.model, args.status, args.kind, args.older_than)):
+                print("[task] rm 需要 <id> 或至少一个过滤(--org/--model/--status/--kind/--older-than)")
+                return 2
+            q, params = "SELECT id FROM tasks WHERE 1=1", []
+            if args.org:
+                q += " AND org=?"; params.append(args.org)
+            if args.model:
+                q += " AND model LIKE ?"; params.append(f"%{args.model}%")
+            if args.status:
+                q += " AND status=?"; params.append(args.status)
+            if args.kind:
+                q += " AND kind=?"; params.append(args.kind)
+            if args.older_than:
+                q += " AND COALESCE(finished_at, created_at) < ?"
+                params.append(int(time.time()) - int(args.older_than) * 86400)
+            ids = [r["id"] for r in conn.execute(q, params).fetchall()]
+        if not ids:
+            print("[task] 没有匹配的任务行")
+            return 0
+        rows = conn.execute(
+            f"SELECT id, status, org, model FROM tasks WHERE id IN ({','.join('?' * len(ids))})",
+            ids).fetchall()
+        live = [r for r in rows if r["status"] not in _tasks.TERMINAL]
+        if live:
+            print(f"[task] 拒绝删除 {len(live)} 条非终态行(先 cancel --task-id N): "
+                  + ", ".join(f"#{r['id']}({r['status']})" for r in live[:5]))
+            return 2
+        print(f"[task] 待删除 {len(rows)} 条终态行" + ("" if args.yes else "  (dry-run; 加 --yes 执行)"))
+        for r in rows[:50]:
+            print(f"    #{r['id']:>5} [{r['status']}] {r['org']}/{r['model']}")
+        if len(rows) > 50:
+            print(f"    ... 其余 {len(rows) - 50} 条略")
+        if args.yes:
+            with conn:
+                conn.execute(f"DELETE FROM tasks WHERE id IN ({','.join('?' * len(rows))})",
+                             [r["id"] for r in rows])
+            print(f"[task] 已删除 {len(rows)} 行")
+        return 0
+
+    print(f"[task] 未知动作 '{action}'; 可用: ls / show <id> / requeue <id> / rm [id]")
+    return 2
 
 
 def _resolve_alerts(args, conn) -> int:
@@ -707,8 +896,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="同步器 v2(多组织) — 可运行骨架")
     ap.add_argument("mode", nargs="?", default="daemon",
                     choices=["daemon", "once", "enqueue", "status", "alerts",
-                             "cancel", "audit", "clean", "retry"],
+                             "cancel", "audit", "clean", "retry", "task"],
                     help="默认 daemon(兼容 run.sh 无参启动)")
+    ap.add_argument("rest", nargs="*",
+                    help="task: 动作与参数(ls / show <id> / requeue <id> / rm <id>)")
     ap.add_argument("--config", default=None, help=f"配置文件(默认 {DEFAULT_CONFIG})")
     # 通用
     ap.add_argument("--org", default=None, help="组织 id(默认全部)")
@@ -733,13 +924,17 @@ def main() -> int:
     ap.add_argument("--prefix", default=None,
                     help="alerts: 按类型前缀过滤(如 vis_mismatch/delete_manual)")
     ap.add_argument("--id", type=int, default=None, help="alerts --resolve: 单条告警 id")
+    ap.add_argument("--unresolved", action="store_true", help="alerts: 只看未复位的告警")
+    ap.add_argument("--all", action="store_true", help="alerts: 不限时间(默认 --since 小时)")
+    ap.add_argument("--older-than", type=int, default=None,
+                    help="task rm: 只清理 N 天前的终态任务行")
     ap.add_argument("--task-id", type=int, default=None, help="cancel: 任务 id")
     ap.add_argument("--force", action="store_true",
                     help="audit: 忽略 15min 对账节流强制执行(默认受节流; 仅 audit 使用)")
     ap.add_argument("--yes", action="store_true",
                     help="clean/retry: 真正执行(默认 dry-run 只列清单)")
     ap.add_argument("--watch", type=int, nargs="?", const=5, default=None,
-                    help="status: 每 N 秒实时刷新(默认 5s, Ctrl+C 退出)")
+                    help="status/alerts: 每 N 秒实时刷新(默认 5s, Ctrl+C 退出)")
     ap.add_argument("--json", action="store_true", help="status/alerts: JSON 输出")
     args = ap.parse_args()
 
@@ -758,6 +953,7 @@ def main() -> int:
         "audit": cmd_audit,
         "clean": cmd_clean,
         "retry": cmd_retry,
+        "task": cmd_task,
     }
     if args.mode == "enqueue" and (not args.org or not args.model):
         ap.error("enqueue 必填: --org 与 --model")
