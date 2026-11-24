@@ -784,6 +784,19 @@ def _refresh_baselines(conn, org, model: str, now: int | None = None) -> None:
         for f in files:
             f["poison"] = _p.classify(f["path"], f["size"])
         _upsert_file_rows(conn, org.id, platform, repo_id, files, now, set())
+        # 2026-11-24: prune 该侧"树上已不存在"的行(upsert 只增改不删 → 僵尸行根因)
+        keep = {f["path"] for f in files}
+        if keep:
+            marks = ",".join("?" for _ in keep)
+            cur = conn.execute(
+                f"DELETE FROM files WHERE org=? AND platform=? AND repo_id=? "
+                f"AND path NOT IN ({marks})", [org.id, platform, repo_id, *keep])
+        else:
+            cur = conn.execute("DELETE FROM files WHERE org=? AND platform=? AND repo_id=?",
+                               [org.id, platform, repo_id])
+        if cur.rowcount:
+            print(f"[transfer] 基线刷新 {platform}/{model}: 清理 {cur.rowcount} 条树上已不存在的行",
+                  flush=True)
         # 操作即落库: 同步成功顺带刷新该侧 models 行(避免靠下轮对账才更新)
         conn.execute(
             "UPDATE models SET last_seen_at=? WHERE org=? AND platform=? AND repo_id=?",
@@ -1056,6 +1069,10 @@ def sync_model(conn, org, task) -> dict:
     if readme is not None:
         readme_staged = bool(_readme_download_and_stage(conn, org, src, dst, model, stage))
         readme_staged = readme_staged and os.path.isfile(os.path.join(stage, "README.md"))
+        if readme_staged and _readme_unchanged(org, dst, model, stage):
+            os.remove(os.path.join(stage, "README.md"))
+            readme_staged = False
+            print(f"[transfer] {model} README 与目标侧一致 → 跳过上传(避免空提交)", flush=True)
 
     # 3.5) 上传前 prune: 只保留"期望集合"(本次 paths + **实际已落盘的** README)
     #      实测两个 SDK 都不清理 <file>.incomplete 等残留, 而 upload_folder 会全传上去
@@ -1198,6 +1215,10 @@ def sync_files(conn, org, task) -> dict:
     if "README.md" in d["to_modelers"]:
         readme_staged = bool(_readme_download_and_stage(conn, org, "scope", "modelers", model, stage))
         readme_staged = readme_staged and os.path.isfile(os.path.join(stage, "README.md"))
+        if readme_staged and _readme_unchanged(org, "modelers", model, stage):
+            os.remove(os.path.join(stage, "README.md"))
+            readme_staged = False
+            print(f"[transfer] {model} README 与目标侧一致 → 跳过上传(避免空提交)", flush=True)
     # 上传前 prune: 只保留"期望集合"(本次 ups + 已落盘的 README)
     expected = set(ups) | ({"README.md"} if readme_staged else set())
     _pruned = _prune_stage(stage, expected)
@@ -1260,6 +1281,16 @@ def sync_files(conn, org, task) -> dict:
     if manual:
         _alert_delete_manual(conn, org.id, model, sorted(manual))
         _log_list(f"{model} 魔乐独有(严格镜像关闭, 待人工确认)", sorted(manual))
+    # 2026-11-24: 只删"目标侧实时存在"的路径 —— 目标侧没有的路径, 删了只会被平台 500
+    # (2026-11 事故: 215 条僵尸基线行 → 反复提交删除 → system_error 500 → 死循环)。
+    # 不在目标侧的路径直接清基线行, 不发任何删除请求。
+    _live_m = set(d.get("cur_modelers") or ())
+    _absent = {pth for pth in dels if pth not in _live_m}
+    if _absent:
+        _n = _delete_rows(conn, org, model, sorted(_absent))
+        print(f"[sync] {model} {len(_absent)} 个待删路径在目标侧已不存在 → 只清基线行 {_n} 条, "
+              f"不发删除请求", flush=True)
+        dels -= _absent
     if dels:
         sizes = {}
         for pth in dels:
@@ -1281,6 +1312,52 @@ def sync_files(conn, org, task) -> dict:
     if uploaded:
         _mark_synced(conn, org.id, "modelers", _repo_id(org, "modelers", model), uploaded, now)
     return {"ok": True, "deleted": len(dels), "uploaded": len(uploaded)}
+
+
+def _delete_rows(conn, org, model: str, paths: list[str]) -> int:
+    """删除两侧 files 中指定 path 的基线行(**不发任何平台请求**; 2026-11-24)。
+
+    用于"待删路径在目标侧已不存在"与"逐条删除已成功的部分"两类场景 —— 只清账, 不删文件。
+    背景见 reconcile.compute_file_diff: 平台对"删除不存在路径"返回 500(system_error),
+    因此绝不能把目标侧没有的路径发给平台。
+    """
+    if not paths:
+        return 0
+    n = 0
+    for plat in ("scope", "modelers"):
+        rid = _repo_id(org, plat, model)
+        for i in range(0, len(paths), 500):
+            batch = paths[i:i + 500]
+            marks = ",".join("?" for _ in batch)
+            cur = conn.execute(
+                f"DELETE FROM files WHERE org=? AND platform=? AND repo_id=? AND path IN ({marks})",
+                [org.id, plat, rid, *batch])
+            n += cur.rowcount or 0
+    conn.commit()
+    return n
+
+
+def _readme_unchanged(org, dst_platform: str, model: str, stage_dir: str) -> bool:
+    """暂存 README 与目标侧当前内容逐字节相同 → True(用于跳过"空提交", 2026-11-24)。
+
+    背景: 任务失败重试时基线不会回写, README 每轮都被重新暂存并提交(内容其实没变),
+    在魔乐侧留下一串空提交。比对口径: 目标侧 README 就是管线变换产物, 直接逐字节比较。
+    """
+    import shutil as _sh
+    import tempfile as _tf
+    staged_path = os.path.join(stage_dir, "README.md")
+    try:
+        staged = open(staged_path, "rb").read()
+    except OSError:
+        return False
+    tmp = _tf.mkdtemp(prefix="rmcmp_")
+    try:
+        _download_one(org, dst_platform, _repo_id(org, dst_platform, model), "README.md", tmp)
+        return open(os.path.join(tmp, "README.md"), "rb").read() == staged
+    except Exception:
+        return False
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
 
 
 def _delete_files(conn, org, platform: str, model: str, paths: list[str]) -> dict:
@@ -1305,34 +1382,43 @@ def _delete_files(conn, org, platform: str, model: str, paths: list[str]) -> dic
         from openmind_hub import create_commit, CommitOperationDelete
         print(f"[transfer] 魔乐 create_commit(删除 {len(paths)} 个文件, 一次 commit)",
               flush=True)
+        deleted: list[str] = []
         try:
             global_limiter.wait()
             create_commit(repo_id,
                           operations=[CommitOperationDelete(path_in_repo=p) for p in paths],
                           token=org.modelers.token,
                           commit_message=f"sync v2 批量删除 {len(paths)} 文件")
-        except Exception:
-            # 回退: 逐个单文件删除
+            deleted = list(paths)
+        except Exception as e:
+            # 2026-11-24: 以前这里把批量异常整个吞掉(只打印"回退"), 现场无法定位平台原因;
+            # 现在打印原始异常, 且逐条删除改为 per-path 容错 —— 已删成功的即时清行,
+            # 失败路径聚合后一次性抛出(不再"第一条失败就整体中断")。
             from openmind_hub.plugins.openmind import om_api as _oma
             print(f"[transfer] 魔乐 create_commit 删除失败 → 回退 OmApi.delete_file × {len(paths)}"
-                  f"(逐个 commit)", flush=True)
+                  f"(逐个 commit); 批量错误: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            failed: list[tuple[str, str]] = []
             for p in paths:
-                global_limiter.wait()
-                _oma.OmApi().delete_file(path_in_repo=p, repo_id=repo_id,
-                                         token=org.modelers.token, commit_message="sync v2 删除")
+                try:
+                    global_limiter.wait()
+                    _oma.OmApi().delete_file(path_in_repo=p, repo_id=repo_id,
+                                             token=org.modelers.token, commit_message="sync v2 删除")
+                    deleted.append(p)
+                except Exception as pe:
+                    failed.append((p, f"{type(pe).__name__}: {str(pe)[:120]}"))
+            _delete_rows(conn, org, model, deleted)      # 已成功的先清账, 重试不再重复
+            if failed:
+                sample = "; ".join(f"{p} ← {err}" for p, err in failed[:3])
+                raise RuntimeError(
+                    f"魔乐逐条删除失败 {len(failed)}/{len(paths)} 个(示例 {sample})")
     # 清 DB 双侧该 path 行
-    marks = ",".join("?" for _ in paths)
-    for plat in ("scope", "modelers"):
-        rid = _repo_id(org, plat, model)
-        conn.execute(f"DELETE FROM files WHERE org=? AND platform=? AND repo_id=? AND path IN ({marks})",
-                     [org.id, plat, rid, *paths])
-    conn.commit()
+    _delete_rows(conn, org, model, deleted)
     # 操作即落库: 审计留痕(按批一条)
     from env_tools import tasks as _t
     _t.insert_alert(conn, org.id, None, model, "warn",
-                    f"audit_delete_file: {platform} 删除 {len(paths)} 个文件: "
-                    + ", ".join(sorted(paths)[:6]) + ("..." if len(paths) > 6 else ""))
-    return {"ok": True, "deleted": list(paths)}
+                    f"audit_delete_file: {platform} 删除 {len(deleted)} 个文件: "
+                    + ", ".join(sorted(deleted)[:6]) + ("..." if len(deleted) > 6 else ""))
+    return {"ok": True, "deleted": deleted}
 
 
 def delete_repo_task(conn, org, task) -> dict:

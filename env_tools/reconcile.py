@@ -375,6 +375,28 @@ def _upsert_file_rows(conn, org_id: str, platform: str, repo_id: str,
         )
 
 
+def _delete_file_rows(conn, org_id: str, platform: str, repo_id: str,
+                      paths: list[str]) -> int:
+    """删除指定路径的基线行(僵尸行清理; 2026-11-24)。
+
+    背景: `compute_file_diff` 每轮把"当前实时树"upsert 进 files, 而 upsert 从不删除
+    "树上已消失"的路径 → 基线会长期保留"只观测过、从未同步成功"的行。魔塔侧一旦回退,
+    这些行就变成 `missing_scope`, 把目标侧根本不存在的文件当删除对象 → 平台 500 → 死循环
+    (2026-11 生产的 GLM-5.3-w4a4c8-mxfp4 事故: 331 条基线 - 116 条实际 = 215 条僵尸行)。
+    """
+    if not paths:
+        return 0
+    n = 0
+    for i in range(0, len(paths), 500):
+        batch = paths[i:i + 500]
+        marks = ",".join("?" for _ in batch)
+        cur = conn.execute(
+            f"DELETE FROM files WHERE org=? AND platform=? AND repo_id=? AND path IN ({marks})",
+            [org_id, platform, repo_id, *batch])
+        n += cur.rowcount or 0
+    return n
+
+
 def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
     """单模型文件级单向对比(对账与 worker 共用)。
 
@@ -439,6 +461,8 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
 
     keep_scope: set[str] = set()
     keep_modelers: set[str] = set()
+    pruned_scope: list[str] = []       # 2026-11-24: 只观测过/目标侧也不存在的行 → 清
+    pruned_modelers: list[str] = []
 
     # ---- 期望侧(魔塔): 增/改 → to_modelers; 删 → missing_scope ----
     for path, row in db_s.items():
@@ -455,8 +479,14 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
                     "DELETE FROM files WHERE org=? AND platform='scope' AND repo_id=? AND path='README.md'",
                     (org.id, scope_repo))
                 continue
-            # 2026-09 对齐 v1: 文件级删除无宽限 —— 魔塔已删即入 missing_scope,
-            # 由 file_batch 同轮删除(不再维护 missing_since 计时, 列保留兼容旧库)
+            # 2026-11-24 修正: 只有"目标侧仍存在 + 确实同步成功过"的路径才值得传播删除。
+            #   - 目标侧已没有(不在 cur_modelers) → 无可删, 清行即可(否则删不存在的文件
+            #     会被平台 500, 2026-11 事故的直接成因);
+            #   - 从未同步成功(last_synced_at 为空, 只是被观测到) → 不是基线, 清行;
+            #     目标侧若真残留同路径, 会由下方 cur_modelers 的 extra 分支兜住。
+            if path not in cur_modelers or not row["last_synced_at"]:
+                pruned_scope.append(path)
+                continue
             out["missing_scope"].add(path)
             continue
         if (row["sha256"] or "") != (cur_f["sha256"] or ""):
@@ -465,12 +495,14 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
     for path in cur_scope:
         if path not in db_s:
             out["to_modelers"].add(path)          # 魔塔新增 → 同步魔乐
+            keep_scope.add(path)                  # 2026-11-24: 同步成功前不把指纹当基线
         elif path not in db_m and path not in cur_modelers:
             # 存量缺失补缺(2026-09 决策修订): 魔塔基线有行、魔乐基线无行且树上也
             # 没有 → 由文件级同步补齐(典型: 3-8 类整目录缺失 TP1/t2v/optional)。
             # 曾因 GLM-5.3-Flash 强制同步事故撤销自动补; 人工排查确认 3-8 属纯缺失
             # 后恢复 —— 有意差异场景由人工先处理(删仓重建/保留), 不在本规则范围。
             out["to_modelers"].add(path)
+            keep_scope.add(path)                  # 2026-11-24: 同上, 未同步前不写指纹
 
     # ---- 现状侧(魔乐): 相对期望偏离 ----
     for path in cur_modelers:
@@ -507,7 +539,9 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
                 out["to_modelers"].add(path)      # 魔乐文件消失(魔塔有)→ 补回
                 keep_modelers.add(path)
             else:
-                out["extra"].add(path)            # 魔乐基线有、魔塔无 → 独有删除
+                # 2026-11-24: 魔乐树上也没有了 → 无可删, 清行(删除只针对目标侧存在的路径;
+                # 历史实现把它算 extra, 会向平台发"删除不存在文件"的请求 → 500 死循环)
+                pruned_modelers.append(path)
 
     # ---- 跨端同名内容一致性(2026-09 用户定稿, 补 v1 语义)----
     # 同路径两侧都有"内容 sha256"且不一致 → 魔塔版覆盖魔乐(魔塔为准):
@@ -613,6 +647,12 @@ def compute_file_diff(conn, org, model: str, now: int | None = None) -> dict:
     _upsert_file_rows(conn, org.id, "scope", scope_repo, list(cur_scope_raw.values()), now, keep_scope)
     _upsert_file_rows(conn, org.id, "modelers", modelers_repo,
                       list(cur_modelers_raw.values()), now, keep_modelers)
+    # 2026-11-24: 清"树上已不存在且无需删除"的僵尸基线行(upsert 不会删除, 必须显式 prune)
+    if pruned_scope or pruned_modelers:
+        n1 = _delete_file_rows(conn, org.id, "scope", scope_repo, pruned_scope)
+        n2 = _delete_file_rows(conn, org.id, "modelers", modelers_repo, pruned_modelers)
+        print(f"[reconcile] {model} 清理僵尸基线行: scope={n1} modelers={n2}"
+              f"(树上已不存在; 未同步/目标侧无 → 不传播删除)", flush=True)
     _commit(conn)
     return out
 
